@@ -19,11 +19,10 @@ class Term:
 
 # Predicate: Symbol like wet/1, owns/2, is_red/1, with name, arity, argument types, and metadata for POS tagging (i.e. noun, adjective, etc.)
 class Predicate:
-    def __init__(self, name: str, arity: int, arg_types: Optional[List[str]] = None, metadata: Optional[dict] = None):
+    def __init__(self, name: str, arity: int, arg_types: Optional[List[str]] = None):
         self.name = name
         self.arity = arity
         self.arg_types = arg_types or ["any"] * arity
-        self.metadata = metadata or {}
 
     def __repr__(self):
         return f"{self.name}/{self.arity}"
@@ -47,10 +46,9 @@ class Atom:
 
 # Rule: Logical rule of the form head :- body where head is an atom and body is a list of atoms (body can be empty -> fact)
 class Rule:
-    def __init__(self, head: Atom, body: Optional[List[Atom]] = None, rule_id: Optional[str] = None):
+    def __init__(self, head: Atom, body: Optional[List[Atom]] = None):
         self.head = head
         self.body = body or []  # empty => fact
-        self.rule_id = rule_id or str(uuid.uuid4())  # useful for graph analysis
 
     def is_fact(self) -> bool:
         return len(self.body) == 0
@@ -91,7 +89,6 @@ CONSTANT_POOL = {
 }
 
 
-# config to control the generation behavior
 GENERATOR_CONFIG = {
     "num_rules": 10,
     "max_body_length": 3,
@@ -269,7 +266,7 @@ def main():
     grounded_program = LogicProgram(grounded_rules)
 
     # Print the grounded logic program
-    print("Grounded Logic Program:\n")
+    print("\nGrounded Logic Program:")
     print(grounded_program)
 
     # Generate graph for grounded logic program
