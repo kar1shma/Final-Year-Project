@@ -74,7 +74,12 @@ PREDICATE_POOL = [
     Predicate("sunny", 0),
     Predicate("wet", 1, arg_types=["object"]),
     Predicate("red", 1, arg_types=["object"]),
-    Predicate("person", 1, arg_types=["entity"]),
+    Predicate("big", 1, arg_types=["object"]),
+    Predicate("small", 1, arg_types=["object"]),
+    Predicate("person", 1, arg_types=["person"]),
+    Predicate("happy", 1, arg_types=["person"]),
+    Predicate("sad", 1, arg_types=["person"]),
+    Predicate("tall", 1, arg_types=["person"]),
     Predicate("owns", 2, arg_types=["person", "object"]),
     Predicate("likes", 2, arg_types=["person", "entity"]),
     Predicate("taller_than", 2, arg_types=["person", "person"]),
@@ -83,15 +88,15 @@ PREDICATE_POOL = [
 
 # Define a pool of constants for each type
 CONSTANT_POOL = {
-    "person": ["socrates", "plato", "alice", "bob"],
-    "object": ["apple", "book", "ball"],
-    "entity": ["socrates", "plato", "alice", "bob", "apple", "book", "ball"]
+    "person": ["socrates", "plato", "alice", "bob", "charlie", "dave", "eve"],
+    "object": ["apple", "book", "ball", "car", "house", "computer", "phone"],
+    "entity": ["socrates", "plato", "alice", "bob", "apple", "book", "ball", "car", "house", "computer", "phone"],
 }
 
 
 GENERATOR_CONFIG = {
-    "num_rules": 10,
-    "max_body_length": 3,
+    "num_rules": 50,
+    "max_body_length": 2,
     "allow_recursion": True,
     "allow_loops": True,
     "branching_factor": 2  # max num of rules with same head predicate
@@ -128,21 +133,65 @@ def generate_logic_program(predicate_pool, constant_pool, config) -> LogicProgra
     return LogicProgram(rules)
 
 
-def generate_rule(predicate_pool: List[Predicate], config: dict, head_pred: Predicate) -> Rule:
+# def generate_rule(predicate_pool: List[Predicate], config: dict, head_pred: Predicate) -> Rule:
+#     head_terms, var_pool = generate_terms_for_predicate(head_pred)
+#     head_atom = Atom(head_pred, head_terms)
+
+#     body_len = random.randint(0, config["max_body_length"])
+#     body_atoms = []
+
+#     for i in range(body_len):
+#         if config["allow_recursion"] and random.random() < 0.3:
+#             pred = head_pred  # recursion
+#         else:
+#             pred = random.choice(predicate_pool)
+
+#         terms = generate_terms_for_predicate(pred, available_vars=var_pool)[0]
+#         body_atoms.append(Atom(pred, terms))
+
+#     return Rule(head=head_atom, body=body_atoms)
+
+
+def generate_rule(predicate_pool: List[Predicate],
+                  config: dict,
+                  head_pred: Predicate) -> Rule:
+    # 1. Build the head
     head_terms, var_pool = generate_terms_for_predicate(head_pred)
     head_atom = Atom(head_pred, head_terms)
 
+    # 2. Sample the raw body
     body_len = random.randint(0, config["max_body_length"])
-    body_atoms = []
-
-    for i in range(body_len):
-        if config["allow_recursion"] and random.random() < 0.3:
-            pred = head_pred  # recursion
-        else:
-            pred = random.choice(predicate_pool)
-
-        terms = generate_terms_for_predicate(pred, available_vars=var_pool)[0]
+    body_atoms: List[Atom] = []
+    for _ in range(body_len):
+        pred = head_pred if (config["allow_recursion"] and random.random() < 0.3) else random.choice(predicate_pool)
+        terms, var_pool = generate_terms_for_predicate(pred, available_vars=var_pool)
         body_atoms.append(Atom(pred, terms))
+
+    # 3. Enforce range-restriction: every head variable must appear elsewhere in the body.
+    head_var_names = {t.name for t in head_terms}
+    body_var_names = {v.name for atom in body_atoms for v in atom.terms}
+    missing = head_var_names - body_var_names
+
+    for mv in missing:
+        # find its position and required type
+        idx = next(i for i,t in enumerate(head_terms) if t.name == mv)
+        var_type = head_pred.arg_types[idx]
+
+        # pick a *different* unary predicate of the same type
+        candidates = [
+            p for p in predicate_pool
+            if p.arity == 1 
+            and p.arg_types[0] == var_type
+            and p.name != head_pred.name      # exclude the head predicate itself
+        ]
+        if not candidates:
+            # if no other unary predicate, *skip* constraining mv
+            continue
+
+        constr_pred = random.choice(candidates)
+        # reuse the Term from var_pool
+        term = next(t for t in var_pool if t.name == mv)
+        body_atoms.append(Atom(constr_pred, [term]))
 
     return Rule(head=head_atom, body=body_atoms)
 
