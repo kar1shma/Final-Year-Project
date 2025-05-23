@@ -1,483 +1,705 @@
 """
-generator.py: parametric Horn-clause benchmark (deduction, depth >= 2)
-Enhanced with reasoning type classification and improved prompts
+generator.py: A parametric Horn-clause benchmark generator.
+Uses proper grounding, closed-world assumption, proof tracing, and LLM integration.
+Supports first-order variable reuse in rule generation.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Set, Any
 import random
 import clingo
 from llama_cpp import Llama
+import json
 import networkx as nx
 import matplotlib.pyplot as plt
+import json
+from tqdm import tqdm
+import itertools
 
-# PRIMITIVES
+# ───────────────────────────────────────────── Primitives
+VAR_NAMES = list("XYZWABCDE")
+
+
 class Term:
-    def __init__(self, name: str, is_variable: bool): 
+    def __init__(self, name: str, is_variable: bool):
         self.name = name
-        self.is_variable = name
-        is_variable
+        self.is_variable = is_variable
 
-    def __repr__(self): 
+    def __repr__(self):
         return self.name
 
+
 class Predicate:
-    def __init__(self, name:str, arity:int, arg_types:Optional[List[str]]=None, nl_template:str|None=None):
+    def __init__(
+        self,
+        name: str,
+        arity: int,
+        arg_types: Optional[List[str]] = None,
+        nl_template: str = None,
+    ):
         self.name = name
         self.arity = arity
-        self.arg_types   = arg_types or ["any"]*arity
+        self.arg_types = arg_types or ["any"] * arity
         self.nl_template = nl_template or self._default_template()
 
     def _default_template(self):
-        if self.arity==0: return f"It is {self.name}"
-        if self.arity==1: return f"{{0}} is {self.name}"
+        if self.arity == 0:
+            return f"it is {self.name}"
+        if self.arity == 1:
+            return f"{{0}} is {self.name}"
         return f"{self.name}({', '.join(f'{{{i}}}' for i in range(self.arity))})"
-    
+
     def __repr__(self):
         return f"{self.name}/{self.arity}"
 
+
 class Atom:
-    def __init__(self, predicate:Predicate, terms:List[Term]):
-        assert len(terms) == predicate.arity  # ensure arity matches
+    def __init__(self, predicate: Predicate, terms: List[Term]):
+        assert len(terms) == predicate.arity
         self.predicate = predicate
         self.terms = terms
 
     def __repr__(self):
-        if self.predicate.arity==0: return self.predicate.name
+        if self.predicate.arity == 0:
+            return self.predicate.name
         return f"{self.predicate.name}({','.join(t.name for t in self.terms)})"
-    
-    def to_asp(self): 
+
+    def to_asp(self) -> str:
         return f"{self}."
-    
-    def to_nl(self):  
+
+    def to_nl(self) -> str:
         return self.predicate.nl_template.format(*[t.name for t in self.terms])
 
+    def __eq__(self, other):
+        return isinstance(other, Atom) and repr(self) == repr(other)
+
+    def __hash__(self):
+        return hash(repr(self))
+
+
 class Rule:
-    def __init__(self, head:Atom, body:Optional[List[Atom]]=None):
+    def __init__(self, head: Atom, body: Optional[List[Atom]] = None):
         self.head = head
         self.body = body or []
 
-    def is_fact(self): 
+    def is_fact(self) -> bool:
         return not self.body
-    
-    def __repr__(self):
-        return self.head.to_asp()[:-1] if self.is_fact() else f"{self.head.to_asp()[:-1]} :- {', '.join(map(str,self.body))}."
-    
-    def to_asp(self):
-        return self.head.to_asp() if self.is_fact() else f"{self.head} :- {', '.join(map(str,self.body))}."
 
-class LogicProgram(list[Rule]):
-    def __init__(self, rules:Optional[List[Rule]]=None):
-        super().__init__(rules or [])
+    def __repr__(self) -> str:
+        return (
+            f"{self.head}."
+            if self.is_fact()
+            else f"{self.head} :- {', '.join(map(str,self.body))}."
+        )
+
+    def to_asp(self) -> str:
+        return repr(self)
+
+    def to_nl(self) -> str:
+        if self.is_fact():
+            return f"{self.head.to_nl()}."
+        cond = ", ".join(b.to_nl() for b in self.body)
+        return f"If {cond}, then {self.head.to_nl()}."
+
+
+class LogicProgram:
+    def __init__(self, rules: Optional[List[Rule]] = None):
         self.rules = rules or []
-    
-    def __repr__(self):
-        return "\n".join(map(str,self.rules))
-    
-    def to_asp(self): 
-        return "\n".join(map(str,self.rules))
 
-# PREDICATES
-PREDICATE_POOL=[
-    Predicate("sunny",0,[],           "It is sunny"),
-    Predicate("wet",1,  ["object"],   "{0} is wet"),
-    Predicate("big",1,  ["object"],   "{0} is big"),
-    Predicate("sad",1,  ["person"],   "{0} is sad"),
-    Predicate("tall",1, ["person"],   "{0} is tall"),
-    Predicate("happy",1,["person"],   "{0} is happy"),
-    Predicate("person",1,["person"],  "{0} is a person"),
-    Predicate("owns",2, ["person","object"], "{0} owns {1}"),
-    Predicate("likes",2, ["person","entity"], "{0} likes {1}"),
-    Predicate("dislikes",2, ["person","entity"], "{0} dislikes {1}"),
+    def __iter__(self):
+        return iter(self.rules)
+
+    def to_asp(self) -> str:
+        return "\n".join(r.to_asp() for r in self.rules)
+
+
+# ───────────────────────────────────────────── Predicates & Constants
+PREDICATE_POOL: List[Predicate] = [
+    Predicate("sunny", 0, [], "it is sunny"),
+    Predicate("cold", 0, [], "it is cold"),
+    Predicate("hot", 0, [], "it is hot"),
+    Predicate("wet", 1, ["object"], "{0} is wet"),
+    Predicate("big", 1, ["object"], "{0} is big"),
+    Predicate("small", 1, ["object"], "{0} is small"),
+    Predicate("sad", 1, ["person"], "{0} is sad"),
+    Predicate("tall", 1, ["person"], "{0} is tall"),
+    Predicate("happy", 1, ["person"], "{0} is happy"),
+    Predicate("hungry", 1, ["person"], "{0} is hungry"),
+    Predicate("owns", 2, ["person", "object"], "{0} owns {1}"),
+    Predicate("likes", 2, ["person", "entity"], "{0} likes {1}"),
+    Predicate("dislikes", 2, ["person", "entity"], "{0} dislikes {1}"),
+    Predicate("friend", 2, ["person", "person"], "{0} is a friend of {1}"),
+    Predicate("enemy", 2, ["person", "person"], "{0} is an enemy of {1}"),
+    Predicate("parent", 2, ["person", "person"], "{0} is a parent of {1}"),
+    Predicate("sibling", 2, ["person", "person"], "{0} is a sibling of {1}"),
 ]
-
-# CONSTANTS
-CONSTANT_POOL={
-    "person":["alice","bob","carol","dave"],
-    "object":["apple","book","ball","car"],
-    "entity":["alice","bob","carol","dave","apple","book","ball","car"]
+CONSTANT_POOL: Dict[str, List[str]] = {
+    "person": ["alice", "bob", "carol", "dave", "eve", "frank", "george"],
+    "object": ["apple", "book", "ball", "car", "pencil", "phone"],
+    # entity = both people and objects
+    "entity": ["alice", "bob", "carol", "dave", "eve", "frank", "george", 
+               "apple", "book", "ball", "car", "pencil", "phone"]
 }
 
-# CONFIGURATION
-CONFIG=dict(num_rules=10,max_body_length=2,allow_recursion=True,branching_factor=2)
+# ───────────────────────────────────────────── Configuration
+CONFIG: Dict[str, Any] = {
+    "num_rules": 4,
+    "max_body_length": 3,
+    "allow_recursion": True,
+    "branching_factor": 2,
+    "min_proof_depth": 1,
+    "num_base_facts": 4,
+}
 
-# VARIABLES
-VAR_NAMES=list("XYZWABC")
+# ───────────────────────────────────────────── Generation Helpers
 
-# ───────────────────────────────────────────── random generation & grounding
-def _new_var(used:set[str]): 
-    return next(v for v in VAR_NAMES if v not in used)
 
-def _gen_terms(pred:Predicate, pool:list[Term]):
-    used={t.name for t in pool}
-    out=[]
-    for _ in range(pred.arity):
-        v=_new_var(used); used.add(v); t=Term(v,True); pool.append(t)
-        out.append(t)
+def _new_var(used_names: Set[str]) -> str:
+    return next(v for v in VAR_NAMES if v not in used_names)
+
+
+# choose fresh or reuse existing variable of correct type
+def _choose_term(
+    arg_type: str, pool: List[Term], reuse_prob: float = 0.5
+) -> Tuple[Term, List[Term]]:
+    # existing variables matching type
+    candidates = [
+        t
+        for t in pool
+        if t.is_variable and (arg_type == "any" or arg_type in t.name or True)
+    ]
+    if candidates and random.random() < reuse_prob:
+        return random.choice(candidates), pool
+    # else fresh
+    used_names = {t.name for t in pool}
+    new_name = _new_var(used_names)
+    new_term = Term(new_name, True)
+    return new_term, pool + [new_term]
+
+
+# generate terms with possible reuse
+def _gen_terms(pred: Predicate, pool: List[Term]) -> Tuple[List[Term], List[Term]]:
+    out = []
+    for arg_type in pred.arg_types:
+        term, pool = _choose_term(arg_type, pool)
+        out.append(term)
+
+    # if this is a binary predicate, never let the two terms coincide
+    if pred.arity == 2 and out[0].name == out[1].name:
+        # try to reuse any other existing var
+        candidates = [t for t in pool if t.is_variable and t.name != out[0].name]
+        if candidates:
+            out[1] = random.choice(candidates)
+        else:
+            # force a fresh one
+            used = {t.name for t in pool}
+            new_name = _new_var(used)
+            new_term = Term(new_name, True)
+            pool.append(new_term)
+            out[1] = new_term
+
     return out, pool
 
-def _gen_rule(pools,config,head_pred):
-    head_ts,pool=_gen_terms(head_pred,[])
-    body=[]
-    for _ in range(random.randint(1, config["max_body_length"])):
-        p = head_pred if config["allow_recursion"] and random.random()<.25 else random.choice(pools)
-        ts, pool=_gen_terms(p,pool); body.append(Atom(p, ts))
-    dangling = {t.name for t in head_ts}-{t.name for a in body for t in a.terms}
-    for v in dangling:                                # bind each head‑only var
-        p = random.choice([q for q in pools if q.arity==1 and q is not head_pred])
-        t = next(t for t in pool if t.name==v)
-        body.append(Atom(p, [t]))
-    return Rule(Atom(head_pred, head_ts),body)
 
-def generate_logic_program(config=CONFIG):
-    rules = []
-    used = {}
+# generate a rule with shared variables
+def _gen_rule(pools: List[Predicate], config: Dict, head_pred: Predicate) -> Rule:
+    head_vars, pool = _gen_terms(head_pred, [])
+    body: List[Atom] = []
+    for _ in range(random.randint(1, config["max_body_length"])):
+        p = (
+            head_pred
+            if config["allow_recursion"] and random.random() < 0.25
+            else random.choice(pools)
+        )
+        ts, pool = _gen_terms(p, pool)
+        body.append(Atom(p, ts))
+
+    # bind dangling head vars
+    head_names = {t.name for t in head_vars}
+    body_names = {t.name for atom in body for t in atom.terms}
+    dangling = head_names - body_names
+    for v in dangling:
+        p = random.choice([q for q in pools if q.arity == 1])
+        # reuse variable v
+        term = next(t for t in pool if t.name == v)
+        body.append(Atom(p, [term]))
+    return Rule(Atom(head_pred, head_vars), body)
+
+
+def generate_logic_program(config: Dict = CONFIG) -> LogicProgram:
+    rules, used_names = [], {}
     for _ in range(config["num_rules"]):
-        if used and random.random()<.5:
-            cand = [p for p, c in used.items() if c<config["branching_factor"]]
-            hpred = random.choice(cand) if cand else random.choice(PREDICATE_POOL)
-        else: hpred = random.choice(PREDICATE_POOL)
-        r=_gen_rule(PREDICATE_POOL, config, hpred)
+        if used_names and random.random() < 0.5:
+            cand = [p for p, c in used_names.items() if c < config["branching_factor"]]
+            hp = random.choice(cand) if cand else random.choice(PREDICATE_POOL)
+        else:
+            hp = random.choice(PREDICATE_POOL)
+        r = _gen_rule(PREDICATE_POOL, config, hp)
         rules.append(r)
-        used[hpred] = used.get(hpred,0) + 1
+        used_names[hp] = used_names.get(hp, 0) + 1
     return LogicProgram(rules)
 
-# --- grounding
-def _instantiate(rule:Rule,pool):
-    sub = {}
-    pick=lambda tp: random.choice(sum(pool.values(),[])) if tp=="any" else random.choice(pool[tp])
-    def inst(a:Atom):
-        ts=[]
-        for i,t in enumerate(a.terms):
-            if t.name not in sub: sub[t.name]=pick(a.predicate.arg_types[i])
-            ts.append(Term(sub[t.name], False))
-        return Atom(a.predicate,ts)
-    return Rule(inst(rule.head),[inst(b) for b in rule.body])
 
-def ground(lp,pool):
-    return LogicProgram([_instantiate(r,pool) for r in lp])
+# ───────────────────────────────────────────── Grounding & CWA
 
-# ───────────────────────────────────────────── clingo helper
-def synthesise_world(rules_src:str,facts_src:str):
-    ctl=clingo.Control()
-    ctl.add("base", [], rules_src+"\n" + facts_src)
-    ctl.ground([("base", [])]); out = []
-    ctl.solve(on_model = lambda m: out.extend(map(str, m.symbols(shown=True))))
+
+def get_all_ground_atoms(lp: LogicProgram) -> Set[Atom]:
+    preds = {r.head.predicate for r in lp.rules} | {
+        b.predicate for r in lp.rules for b in r.body
+    }
+    atoms = set()
+    for p in preds:
+        if p.arity == 0:
+            atoms.add(Atom(p, []))
+        elif p.arity == 1:
+            for c in CONSTANT_POOL.get(p.arg_types[0], []):
+                atoms.add(Atom(p, [Term(c, False)]))
+        else:
+            for c1 in CONSTANT_POOL.get(p.arg_types[0], []):
+                for c2 in CONSTANT_POOL.get(p.arg_types[1], []):
+                    if c1 != c2:  # avoid self-pairs
+                        atoms.add(Atom(p, [Term(c1, False), Term(c2, False)]))
+    return atoms
+
+
+def generate_base_facts(lp: LogicProgram, num_facts: int) -> List[Atom]:
+    all_atoms = list(get_all_ground_atoms(lp))
+    # drop any 2-ary ground atom like p(c,c)
+    all_atoms = [
+        a for a in all_atoms
+        if not (a.predicate.arity == 2 and a.terms[0].name == a.terms[1].name)
+    ]
+    return random.sample(all_atoms, k=min(num_facts, len(all_atoms)))
+
+
+def clingo_grounding(lp: LogicProgram, base_facts: List[Atom]) -> Dict[str, Set[Atom]]:
+    rules = lp.to_asp()
+    facts = "\n".join(a.to_asp() for a in base_facts)
+    preds = {r.head.predicate for r in lp.rules} | {
+        b.predicate for r in lp.rules for b in r.body
+    }
+    shows = "\n".join(f"#show {p.name}/{p.arity}." for p in preds)
+    ctl = clingo.Control(arguments = ["--warn=none"])
+    # ctl = clingo.Control()
+    ctl.add("base", [], rules + "\n" + facts + "\n" + shows)
+    ctl.ground([("base", [])])
+    true_strs = set()
+    ctl.solve(
+        on_model=lambda m: true_strs.update(str(x) for x in m.symbols(shown=True))
+    )
+    true_atoms = set()
+    for s in true_strs:
+        if "(" in s:
+            name, args = s.split("(", 1)
+            args = args.rstrip(")").split(",")
+            pred = next(
+                (p for p in PREDICATE_POOL if p.name == name and p.arity == len(args)),
+                None,
+            )
+            if pred:
+                true_atoms.add(Atom(pred, [Term(a, False) for a in args]))
+        else:
+            pred = next(
+                (p for p in PREDICATE_POOL if p.name == s and p.arity == 0), None
+            )
+            if pred:
+                true_atoms.add(Atom(pred, []))
+    true_atoms = {a for a in true_atoms if not (a.predicate.arity == 2 and a.terms[0].name == a.terms[1].name)}
+    all_atoms = get_all_ground_atoms(lp)
+    false_atoms = all_atoms - true_atoms
+    return {"true_facts": true_atoms, "false_facts": false_atoms}
+
+
+# ───────────────────────────────────────────── Proof Tracing
+
+
+def _generate_substitutions(vars: Dict[str, str]) -> List[Dict[str, str]]:
+    if not vars:
+        return [{}]
+    name, typ = next(iter(vars.items()))
+    rest = vars.copy()
+    rest.pop(name)
+    subs_rest = _generate_substitutions(rest)
+    out = []
+    for c in CONSTANT_POOL.get(typ, []):
+        for sub in subs_rest:
+            d = sub.copy()
+            d[name] = c
+            out.append(d)
     return out
 
-# ──────────────────────────────────────────── proof‑depth utilities
-def ground_atom(a:Atom)->str: return f"{a}."
 
-def normalise_atom(atom_str):
-    """Remove trailing full-stop from atom strings for consistent comparison."""
-    return atom_str[:-1] if atom_str.endswith('.') else atom_str
+def _apply_substitution(a: Atom, sub: Dict[str, str]) -> Atom:
+    terms = []
+    for t in a.terms:
+        if t.is_variable:
+            terms.append(Term(sub.get(t.name, t.name), False))
+        else:
+            terms.append(t)
+    return Atom(a.predicate, terms)
 
-def min_proof_depth(q:Atom, lp:LogicProgram, facts:list[str]):
-    """Calculate minimum proof depth with normalised atom strings."""
-    # normalise all facts
-    known = {normalise_atom(fact) for fact in facts}
-    depth = 0
-    
+
+def _get_rule_groundings(rule: Rule) -> List[Dict[str, Any]]:
+    vars = {}
+    for atom in [rule.head] + rule.body:
+        for i, t in enumerate(atom.terms):
+            if t.is_variable:
+                vars[t.name] = atom.predicate.arg_types[i]
+    subs = _generate_substitutions(vars)
+    groundings = []
+    for sub in subs:
+        h = _apply_substitution(rule.head, sub)
+        b = [_apply_substitution(x, sub) for x in rule.body]
+        groundings.append({"head": h, "body": b})
+    return groundings
+
+
+def determine_how_proved(
+    lp: LogicProgram, base: List[Atom], target: Atom
+) -> Dict[str, Any]:
+    known = set(base)
+    derived = {str(a): 0 for a in base}
+    deriv_rules = {}
+    steps = []
+    itr = 0
     while True:
-        # Check if query is already known
-        if normalise_atom(ground_atom(q)) in known:
-            return depth
-            
-        # Derive new facts
+        itr += 1
         new = set()
-        for r in lp:
-            # Check if all body atoms are known
-            if all(normalise_atom(ground_atom(b)) in known for b in r.body):
-                head = normalise_atom(ground_atom(r.head))
-                new.add(head)
-                
-        # If no new facts, query is not derivable
-        if not new - known:
-            raise ValueError("query not derivable")
-            
-        # Add new facts and increment depth
-        known |= new
-        depth += 1
-
-def build_seed_facts(lp:LogicProgram,min_depth:int=2) -> Tuple[list[str],Atom]:
-    fact_list:list[str]=[]
-    fact_set:set[str]=set()
-    candidates=[r for r in lp if not r.is_fact() and r.head.predicate.arity > 0]
-    random.shuffle(candidates)
-
-    for r in candidates:
-        try:
-            if min_proof_depth(r.head,lp,fact_list) >= min_depth:
-                return fact_list, r.head
-        except ValueError: pass
-
-        # still not deep enough – add 1 body atom that isn't already a fact
-        for b in r.body:
-            ga=ground_atom(b)
-            if ga not in fact_set:
-                fact_list.append(ga); fact_set.add(ga)
-            break   # add at most 1 per loop
-
-    # fallback: last candidate
-    tgt = candidates[-1]
-    for b in tgt.body:
-        ga=ground_atom(b)
-        if ga not in fact_set:
-            fact_list.append(ga); fact_set.add(ga)
-    return fact_list, tgt.head
-
-# ───────────────────────────────────────────── new func to simulate Clingo reasoning
-def explain_reasoning_steps(rules, facts, query, proof_steps):
-    """
-    Generate a natural language explanation of the reasoning steps.
-    """
-    explanation = ["Reasoning process:"]
-    
-    # Start with known facts
-    explanation.append("Starting with known facts:")
-    for fact in facts:
-        explanation.append(f"- {fact}")
-    
-    # Explain each step in the proof
-    explanation.append("Steps:")
-    for step_num, (derived_fact, rule_idx) in enumerate(proof_steps, 1):
-        if rule_idx is not None:
-            rule = rules[rule_idx]
-            body_conditions = ", ".join(b.to_nl() for b in rule.body)
-            explanation.append(f"Step {step_num}: Since {body_conditions}, we can conclude that {rule.head.to_nl()}.")
-    
-    # Final conclusion
-    explanation.append(f"\nTherefore, {query.to_nl()} is {'true' if proof_steps else 'false'}.")
-    
-    return "\n".join(explanation)
-
-
-def debug_clingo_reasoning(rules, facts, query):
-    """
-    Debug function that tracks the reasoning steps for explanation.
-    """
-    print("\n===== DEBUGGING CLINGO REASONING =====")
-    print("Rules:")
-    for i, rule in enumerate(rules):
-        print(f"R{i+1}: {rule}")
-    
-    print("\nFacts:")
-    for fact in facts:
-        print(f"  {fact}")
-    
-    print("\nQuery: Does", query.to_nl(), "hold?")
-    
-    # Simulate the computation that Clingo performs
-    known = set(facts)
-    iterations = 0
-    proof_steps = []  # Track (derived_fact, rule_idx) pairs
-    
-    print("\nDeduction process:")
-    while True:
-        iterations += 1
-        print(f"\nIteration {iterations}:")
-        
-        # Compute new facts derivable in this iteration
-        new_facts = set()
-        for i, rule in enumerate(rules):
-            # Skip facts (rules with empty body)
+        for idx, rule in enumerate(lp.rules):
             if rule.is_fact():
                 continue
-                
-            # Check if all body atoms are known
-            body_satisfied = True
-            for body_atom in rule.body:
-                body_atom_str = ground_atom(body_atom)
-                if normalise_atom(body_atom_str) not in {normalise_atom(f) for f in known}:
-                    body_satisfied = False
-                    break
-            
-            # If body is satisfied, derive the head
-            if body_satisfied:
-                head_str = ground_atom(rule.head)
-                normalised_head = normalise_atom(head_str)
-                if normalised_head not in {normalise_atom(f) for f in known}:
-                    new_facts.add(head_str)
-                    print(f"  Applied R{i+1} to derive: {head_str}")
-                    proof_steps.append((head_str, i))  # Store the derived fact and rule index
-        
-        # If no new facts, we've reached a fixed point
-        if not new_facts:
+            for gr in _get_rule_groundings(rule):
+                if all(b in known for b in gr["body"]):
+                    h = gr["head"]
+                    if h not in known:
+                        new.add(h)
+                        deriv_rules[str(h)] = {
+                            "rule_idx": idx,
+                            "body_atoms": [str(x) for x in gr["body"]],
+                        }
+                        derived[str(h)] = itr
+        if not new:
             break
-            
-        # Add new facts to known facts
-        known.update(new_facts)
-    
-    # Check if query is derivable
-    query_str = ground_atom(query)
-    normalised_query = normalise_atom(query_str)
-    normalised_known = {normalise_atom(f) for f in known}
-    result = normalised_query in normalised_known
-    
-    print("\nFinal result:")
-    print(f"Query '{query_str}' is {'derivable' if result else 'not derivable'}")
-    print(f"Answer: {'YES' if result else 'NO'}")
-    
-    return result, proof_steps
+        known |= new
+    if target not in known:
+        return {"derivable": False, "steps": [], "depth": -1}
+    cur = str(target)
+    depth = derived[cur]
+    while cur in deriv_rules:
+        info = deriv_rules[cur]
+        steps.append({"derived_fact": cur, **info})
+        bodies = info["body_atoms"]
+        if not bodies:
+            break
+        cur = max(bodies, key=lambda x: derived.get(x, 0))
+    steps.reverse()
+    return {"derivable": True, "steps": steps, "depth": depth}
 
-# ───────────────────────────────────────────── Prompt for LLM
-def generate_explanation_prompt(rules, facts, query):
+
+# ───────────────────────────────────────────── Target Atom Selection
+
+def select_target(
+    all_facts: Dict[str, Set[Atom]],
+    base: List[Atom],
+    grounded: Dict[str, Dict[str, Any]],
+    min_depth: int,
+    yes_prob: float = 0.5,
+) -> Tuple[Atom, bool]:
     """
-    Generate a prompt that asks the LLM to explain its reasoning process.
-    
-    Args:
-        rules: List of Rule objects
-        facts: List of fact strings
-        query: The query Atom object
-        
-    Returns:
-        str: Explanation prompt
+    Balanced YES/NO selection. 50% of the time we pick a derivable target
+    (weighted by proof depth), otherwise a false one.  When YES, only atoms
+    with proof_depth >= min_depth (or >=1 if none meet min_depth).
     """
-    # Convert rules to natural language with numbers for reference
-    nl_rules = []
-    for i, r in enumerate(rules, 1):
-        if r.is_fact():
-            nl_rules.append(f"{r.head.to_nl()}.")
-        else:
-            conditions = ", ".join(b.to_nl() for b in r.body)
-            nl_rules.append(f"If {conditions}, then {r.head.to_nl()}.")
-    
-    # Format facts
-    nl_facts = [f"* {normalise_atom(f)}." for f in facts]
-    
-    prompt = f"""
-You are a logical reasoning assistant. Given some information, you must determine if a query follows.
 
-BACKGROUND KNOWLEDGE:
-{chr(10).join(nl_rules)}
+    base_set = set(base)
 
-KNOWN INFORMATION:
-{chr(10).join(nl_facts)}
+    # 1) collect all derivable (non-base) atoms with their depths
+    derivables = [
+        (atom, info["depth"])
+        for atom in all_facts["true_facts"]
+        if (info := grounded.get(str(atom), {})).get("derivable", False)
+        and atom not in base_set
+    ]
 
-QUESTION:
-Does {query.to_nl()} hold?
+    # 2) collect all false atoms
+    falses = list(all_facts["false_facts"])
 
-Approach this step by step, explaining each step of your reasoning clearly.
-After explaining your reasoning, answer with YES or NO.
-"""
-    
-    return prompt
+    # 3) decide if we want a YES
+    want_yes = bool(derivables) and (random.random() < yes_prob)
+
+    if want_yes:
+        # filter by min_depth; if empty, fall back to depth>=1
+        candidates = [(a, d) for (a, d) in derivables if d >= min_depth]
+        if not candidates:
+            candidates = [(a, d) for (a, d) in derivables if d >= 1]
+
+        atoms, depths = zip(*candidates)
+        total = sum(depths)
+        weights = [d / total for d in depths]
+        chosen = random.choices(atoms, weights=weights, k=1)[0]
+        return chosen, True
+
+    # NO branch: pick a false atom if possible
+    if falses:
+        return random.choice(falses), False
+
+    # fallback #1: if there are derivables but no falses, force a YES
+    if derivables:
+        chosen, _ = random.choice(derivables)
+        return chosen, True
+
+    # fallback #2: truly degenerate case — pick any ground atom
+    all_atoms = list(all_facts["true_facts"] | all_facts["false_facts"])
+    if all_atoms:
+        chosen = random.choice(all_atoms)
+        return chosen, (chosen in all_facts["true_facts"])
+
+    # shouldn’t happen
+    raise RuntimeError(
+        "select_target: no atoms at all in true_facts or false_facts!"
+    )
+
+# ───────────────────────────────────────────── Explanation
+def explain_reasoning_steps(
+    lp: LogicProgram,
+    base: List[Atom],
+    target: Atom,
+    info: Dict[str, Any],
+    true_facts: Set[Atom],
+) -> str:
+    if not info.get("derivable", False):
+        return f"'{target.to_nl()}' cannot be derived."
+    lines = ["Reasoning process:"] + [f"- {a.to_nl()}" for a in base]
+    for i, st in enumerate(info["steps"], 1):
+        head = next(a for a in true_facts if str(a) == st["derived_fact"])
+        body = [next(a for a in true_facts if str(a) == x) for x in st["body_atoms"]]
+        cond = ", ".join(b.to_nl() for b in body)
+        lines.append(
+            f"Step {i}: Since {cond}, by Rule {st['rule_idx']+1} we get {head.to_nl()}."
+        )
+    lines.append(f"\nTherefore, '{target.to_nl()}' is true.")
+    return "\n".join(lines)
 
 
-def build_grounded_world_graph(logic_program: LogicProgram):
-    """
-    Build a directed graph from grounded rules: objects are nodes,
-    binary predicates are labeled edges, unary predicates become self-loops.
-    """
-    G = nx.MultiDiGraph()
-    for rule in logic_program.rules:
-        for atom in [rule.head] + rule.body:
-            pred = atom.predicate
-            if pred.arity == 2:
-                src, tgt = atom.terms[0].name, atom.terms[1].name
-                G.add_edge(src, tgt, label=pred.name)
-            elif pred.arity == 1:
-                node = atom.terms[0].name
-                G.add_edge(node, node, label=pred.name)
+# ───────────────────────────────────────────── Visualisation
+def build_dependency_graph(lp: LogicProgram) -> nx.DiGraph:
+    G = nx.DiGraph()
+    for r in lp.rules:
+        for b in r.body:
+            G.add_edge(r.head.predicate.name, b.predicate.name)
     return G
 
-def draw_grounded_world_graph(G):
+
+def draw_dependency_graph(G: nx.DiGraph):
+    plt.figure(figsize=(8, 6))
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_color="lightgreen", node_size=600)
+    plt.title("Predicate Dependency")
+    plt.show()
+
+
+def build_grounded_world_graph(true_facts: Set[Atom]) -> nx.MultiDiGraph:
+    G = nx.MultiDiGraph()
+    for a in true_facts:
+        if a.predicate.arity == 2:
+            G.add_edge(a.terms[0].name, a.terms[1].name, label=a.predicate.name)
+        elif a.predicate.arity == 1:
+            G.add_edge(a.terms[0].name, a.terms[0].name, label=a.predicate.name)
+        else:
+            G.add_node(a.predicate.name)
+    return G
+
+
+def draw_grounded_world_graph(G: nx.MultiDiGraph):
     plt.figure(figsize=(12, 6))
     pos = nx.spring_layout(G)
     nx.draw(G, pos, with_labels=True, node_color="lightblue", node_size=400)
     nx.draw_networkx_edge_labels(G, pos, edge_labels=nx.get_edge_attributes(G, "label"))
-    plt.title("Grounded World Graph")
-    plt.show()
-
-def build_dependency_graph(logic_program: LogicProgram):
-    """
-    Create a predicate-level dependency graph: head -> body edges.
-    """
-    G = nx.DiGraph()
-    for rule in logic_program.rules:
-        head = rule.head.predicate.name
-        for atom in rule.body:
-            G.add_edge(head, atom.predicate.name)
-    return G
-
-def draw_dependency_graph(G):
-    plt.figure(figsize=(8, 6))
-    pos = nx.spring_layout(G)
-    nx.draw(G, pos, with_labels=True, node_color="lightgreen", node_size=600, arrows=True)
-    plt.title("Predicate Dependency Graph")
+    plt.title("Grounded World")
     plt.show()
 
 
-# ───────────────────────────────────────────── LLM helper
-llm=Llama(model_path="models/mistral/mistral-7b-instruct-v0.1.Q4_K_M.gguf",n_ctx=2048, verbose=False)
+# ───────────────────────────────────────────── LLM Integration
+def setup_llm(
+    path: str = "models/mistral/mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+) -> Optional[Llama]:
+    try:
+        return Llama(model_path=path, n_ctx=10000, verbose=False)
+    except:
+        print("Warning: failed to load LLM")
+        return None
 
-def ask_llm_yesno(prompt:str)->bool:
-    txt=llm(prompt, max_tokens=1024)["choices"][0]["text"]
-    # Look for YES/NO at the end of the text
-    lines = txt.strip().split('\n')
-    last_lines = " ".join(lines[-3:]).lower()  # Look at last 3 lines for conclusion
-    return "yes" in last_lines and not ("no" in last_lines and last_lines.rfind("no") > last_lines.rfind("yes"))
 
-MAX_ATTEMPTS=1000
+def evaluate_with_llm(llm: Llama, prompt: str) -> Tuple[str, bool]:
+    resp = llm(prompt, max_tokens=1024)["choices"][0]["text"].strip()
+    verdict = " ".join(resp.split()[-3:]).lower()
+    ans = "yes" in verdict and not (
+        "no" in verdict and verdict.rfind("no") > verdict.rfind("yes")
+    )
+    return resp, ans
 
-def main():
-    for _ in range(MAX_ATTEMPTS):
-        gp_abstract = generate_logic_program()
-        gp_grounded = ground(gp_abstract, CONSTANT_POOL)
-        try:
-            seed, query = build_seed_facts(gp_grounded, min_depth=2)
-            depth = min_proof_depth(query, gp_grounded, seed)
-            if depth>=2: 
-                break
-        except ValueError:
-            continue
+# ───────────────────────────────────────────── Deduction
+def generate_deduction_prompt(
+    lp: LogicProgram, base: List[Atom], target: Atom
+) -> str:
+    ru = [f"Rule {i+1}: {r.to_nl()}" for i, r in enumerate(lp.rules)]
+    fa = [f"- {a.to_nl()}" for a in base]
+    return f"""
+You are given the following information:
+{chr(10).join(ru)}
+
+And the following facts:
+{chr(10).join(fa)}
+
+QUESTION:
+Is “{target.to_nl()}” true?
+
+Answer only with a single word: “YES” or “NO”.
+"""
+
+def generate_deduction_task(config: Dict[str,Any]) -> Tuple[str,str,str]:
+    # 1) generate program + base facts
+    lp         = generate_logic_program(config)
+    base       = generate_base_facts(lp, config["num_base_facts"])
+    # 2) ground + collect true/false
+    all_facts  = clingo_grounding(lp, base)
+    # 3) trace proofs, pick target
+    proofs     = { str(f): determine_how_proved(lp, base, f)
+                   for f in all_facts["true_facts"] }
+    target, is_true = select_target(all_facts, base, proofs, config["min_proof_depth"])
+    # 4) form q, c, t
+    if is_true:
+        depth = proofs[str(target)]["depth"]
     else:
-        raise RuntimeError("depth>=2 sample not found")
+        depth = "not applicable"
+    q = target.to_asp().strip()
+    c = lp.to_asp() + "\n" + "\n".join(f.to_asp() for f in base)
+    t = "YES" if is_true else "NO"
+    return q, c, t, depth
+
+
+# ───────────────────────────────────────────── Abduction
+def extract_abduction_hypotheses(
+    proof_info: dict
+) -> List[str]:
+    """
+    Returns the set of body-atoms in the proof that were not themselves derived, 
+    i.e. the minimal base facts needed to entail the target.
+    """
+    derived = { step["derived_fact"] for step in proof_info["steps"] }
+    hyps = set()
+    for step in proof_info["steps"]:
+        for atom_str in step["body_atoms"]:
+            if atom_str not in derived:
+                hyps.add(atom_str)
+    return list(hyps)
+
+
+def generate_abduction_prompt(
+    lp: LogicProgram,
+    base: List[Atom],
+    observation: Atom
+) -> str:
+    # 1) render rules in natural language
+    rules_nl = [f"Rule {i+1}: {r.to_nl()}" for i, r in enumerate(lp.rules)]
+    # 2) render base facts in natural language
+    facts_nl = [f"- {a.to_nl()}." for a in base]
+    return f"""
+You are given the following rules:
+{chr(10).join(rules_nl)}
+
+And you observe:
+- {observation.to_nl()}
+
+Which of the following facts would you need to assume, in natural language,
+so that the observation follows?  List them as a comma-separated list of sentences.
+{chr(10).join(facts_nl)}
+"""
+
+def generate_abduction_task(config: Dict[str,Any]) -> Tuple[str,str,List[str]]:
+    MAX_ATTEMPTS = 100
+    for attempt in range(MAX_ATTEMPTS):
+        # 1) rules + base facts
+        lp    = generate_logic_program(config)
+        base  = generate_base_facts(lp, config["num_base_facts"])
+        # 2) ground + proofs
+        all_facts = clingo_grounding(lp, base)
+        proofs    = { f: determine_how_proved(lp, base, f)
+                    for f in all_facts["true_facts"] }
+        # 3) pick any derivable
+        derivable = [
+            a for a, info in proofs.items()
+            if info["derivable"] and info["depth"] > 0
+        ]
+        if derivable:
+            observation = random.choice(derivable)
+            proof_info  = proofs[observation]
+            break
+    else:
+        raise RuntimeError(f"No abduction candidate found after {MAX_ATTEMPTS} tries.")
     
-    dep_G = build_dependency_graph(gp_abstract)
-    draw_dependency_graph(dep_G)
+    # 4) extract leaf hypotheses
+    hyps      = extract_abduction_hypotheses(proof_info)
+    # 5) form q, c, t
+    q = observation.to_asp().strip()
+    rules_src = lp.to_asp()
+    facts_src = "\n".join(f.to_asp() for f in base)
+    c = rules_src + "\n" + facts_src
+    t = hyps
 
-    # Get reasoning steps and result
-    result, proof_steps = debug_clingo_reasoning(gp_grounded, seed, query)
-        
-    # Generate explanation of the reasoning process
-    explanation = explain_reasoning_steps(gp_grounded, seed, query, proof_steps)
-    print(f"\n{explanation}")
+    return q, c, t
 
-    # Check ASP world answer (using normalised comparison)
-    asp_world = synthesise_world("\n".join(r.to_asp() for r in gp_grounded), "\n".join(seed))
-    query_atom = normalise_atom(ground_atom(query))
-    asp_world_normalised = {normalise_atom(fact) for fact in asp_world}
-    asp_truth = query_atom in asp_world_normalised
 
-    # Visualize grounded world graph (ASP-entailed atoms)
-    asp_atoms = []
-    for atom_str in asp_world:
-        if "(" in atom_str:
-            name, rest = atom_str.split("(",1)
-            args = rest.rstrip(")").split(",")
-            asp_atoms.append(Atom(Predicate(name, len(args)), [Term(a, False) for a in args]))
-        else:
-            asp_atoms.append(Atom(Predicate(atom_str, 0), []))
-    grounded_lp = LogicProgram([Rule(a, []) for a in asp_atoms])
-    world_G = build_grounded_world_graph(grounded_lp)
-    draw_grounded_world_graph(world_G)
+def build_deduction_benchmark(n: int, config: Dict[str,Any], out_path: str):
+    """
+    Generate n deduction tasks and write them as JSON to out_path.
+    Each task is a dict { "q": ..., "c": ..., "t": ... }.
+    """
+    bench = []
+    for _ in range(n):
+        q, c, t, depth = generate_deduction_task(config)
+        bench.append({"q": q, "c": c, "t": t, "depth": depth})
+    with open(out_path, "w") as f:
+        json.dump(bench, f, indent=2)
 
-    # Generate explanation prompt and get LLM answer with explanation
-    explanation_prompt = generate_explanation_prompt(gp_grounded, seed, query)
-    llm_truth = ask_llm_yesno(explanation_prompt)
-    
-    # Get and display the full LLM explanation
-    llm_explanation = llm(explanation_prompt, max_tokens=1024)["choices"][0]["text"]
 
-    print("=========== EXAMPLE ===========")
-    print(explanation_prompt)
-    print("--------------------------------")
-    print("Proof depth (gold):", depth)
-    print("ASP:", "YES" if asp_truth else "NO")
-    print("LLM:", "YES" if llm_truth else "NO")
-    print("\nLLM's explanation:")
-    print(llm_explanation)
+if __name__ == "__main__":
+    n = 500
+    build_deduction_benchmark(n, config=CONFIG, out_path="deduction_benchmark_1.json")
+    print(f"Wrote {n} deduction examples to deduction_benchmark_1.json")
 
-if __name__=="__main__":
-    main()
+
+
+
+def build_full_benchmark(out_path, examples_per=2, max_tries=200):
+    bench = []
+    for nr, nf, mb, dd in itertools.product(range(4,5), range(4,5), range(2,3), [0,1,2,3]):
+        config = {
+          **CONFIG,
+          "num_rules":       nr,
+          "num_base_facts":  nf,
+          "max_body_length": mb,
+          # set min_proof_depth=0 to allow ANY derivable
+          "min_proof_depth": 0,
+        }
+        found = []
+        tries = 0
+        while len(found) < examples_per and tries < max_tries:
+            q,c,t,depth = generate_deduction_task(config)
+            d_norm = 0 if t=="NO" else depth
+            if d_norm == dd and not any(x["q"]==q and x["c"]==c for x in found):
+                found.append({"q":q,"c":c,"t":t,"depth":d_norm,
+                              "params": (nr,nf,mb)})
+            tries += 1
+
+        if len(found) < examples_per:
+            tqdm.write(f"Only {len(found)}/{examples_per} for"
+                       f" (rules={nr},facts={nf},body={mb},depth={dd})")
+        bench.extend(found)
+
+    with open(out_path, "w") as f:
+        json.dump(bench, f, indent=2)
+    print(f"Wrote {len(bench)} tasks to {out_path}")
+
+# if __name__=="__main__":
+#     build_full_benchmark("deduction_benchmark_final.json")
