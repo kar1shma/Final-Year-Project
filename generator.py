@@ -578,78 +578,6 @@ def generate_deduction_task(config: Dict[str,Any]) -> Tuple[str,str,str]:
     return q, c, t, depth
 
 
-# ───────────────────────────────────────────── Abduction
-def extract_abduction_hypotheses(
-    proof_info: dict
-) -> List[str]:
-    """
-    Returns the set of body-atoms in the proof that were not themselves derived, 
-    i.e. the minimal base facts needed to entail the target.
-    """
-    derived = { step["derived_fact"] for step in proof_info["steps"] }
-    hyps = set()
-    for step in proof_info["steps"]:
-        for atom_str in step["body_atoms"]:
-            if atom_str not in derived:
-                hyps.add(atom_str)
-    return list(hyps)
-
-
-def generate_abduction_prompt(
-    lp: LogicProgram,
-    base: List[Atom],
-    observation: Atom
-) -> str:
-    # 1) render rules in natural language
-    rules_nl = [f"Rule {i+1}: {r.to_nl()}" for i, r in enumerate(lp.rules)]
-    # 2) render base facts in natural language
-    facts_nl = [f"- {a.to_nl()}." for a in base]
-    return f"""
-You are given the following rules:
-{chr(10).join(rules_nl)}
-
-And you observe:
-- {observation.to_nl()}
-
-Which of the following facts would you need to assume, in natural language,
-so that the observation follows?  List them as a comma-separated list of sentences.
-{chr(10).join(facts_nl)}
-"""
-
-def generate_abduction_task(config: Dict[str,Any]) -> Tuple[str,str,List[str]]:
-    MAX_ATTEMPTS = 100
-    for attempt in range(MAX_ATTEMPTS):
-        # 1) rules + base facts
-        lp    = generate_logic_program(config)
-        base  = generate_base_facts(lp, config["num_base_facts"])
-        # 2) ground + proofs
-        all_facts = clingo_grounding(lp, base)
-        proofs    = { f: determine_how_proved(lp, base, f)
-                    for f in all_facts["true_facts"] }
-        # 3) pick any derivable
-        derivable = [
-            a for a, info in proofs.items()
-            if info["derivable"] and info["depth"] > 0
-        ]
-        if derivable:
-            observation = random.choice(derivable)
-            proof_info  = proofs[observation]
-            break
-    else:
-        raise RuntimeError(f"No abduction candidate found after {MAX_ATTEMPTS} tries.")
-    
-    # 4) extract leaf hypotheses
-    hyps      = extract_abduction_hypotheses(proof_info)
-    # 5) form q, c, t
-    q = observation.to_asp().strip()
-    rules_src = lp.to_asp()
-    facts_src = "\n".join(f.to_asp() for f in base)
-    c = rules_src + "\n" + facts_src
-    t = hyps
-
-    return q, c, t
-
-
 def build_deduction_benchmark(n: int, config: Dict[str,Any], out_path: str):
     """
     Generate n deduction tasks and write them as JSON to out_path.
@@ -662,44 +590,163 @@ def build_deduction_benchmark(n: int, config: Dict[str,Any], out_path: str):
     with open(out_path, "w") as f:
         json.dump(bench, f, indent=2)
 
+# ───────────────────────────────────────────── Abduction
+def extract_abduction_hypotheses(proof_info: dict) -> List[str]:
+    """
+    Given proof_info from determine_how_proved, return the set
+    of leaf-premise strings (no trailing dot) that were used to derive the target.
+    """
+    if not proof_info.get("derivable", False):
+        return []
+    derived = {step["derived_fact"] for step in proof_info["steps"]}
+    leaves = set()
+    for step in proof_info["steps"]:
+        for atom_str in step["body_atoms"]:
+            if atom_str not in derived:
+                leaves.add(atom_str)
+    return list(leaves)
+
+
+def generate_abduction_prompt(
+    lp: LogicProgram,
+    context_facts: List[Atom],
+    query: Atom
+) -> str:
+    """
+    Build the pure-NL YES/NO prompt:
+      - rules (in NL),
+      - context_facts (in NL),
+      - QUESTION: Could “<query>” be true?
+    """
+    rules_nl = "\n".join(f"Rule {i+1}: {r.to_nl()}"
+                          for i,r in enumerate(lp.rules))
+    facts_nl = "\n".join(f"- {a.to_nl()}." for a in context_facts)
+    return f"""
+You are given the following rules:
+{rules_nl}
+
+And the following facts:
+{facts_nl}
+
+QUESTION:
+Could “{query.to_nl()}” be true?
+
+Answer only “YES” or “NO”.
+""".strip()
+
+
+def _make_abduction_yes_task(config: Dict[str,Any]) -> Tuple[str,str,str,str]:
+    """
+    Force a YES-case:
+      • pick a derivable target `obs`
+      • hide exactly one *leaf* premise needed to prove it
+      • context includes all other base–facts + `obs`
+      • query is the hidden premise
+      • t = "YES"
+    """
+    for _ in range(200):
+        lp   = generate_logic_program(config)
+        base = generate_base_facts(lp, config["num_base_facts"])
+        all_facts = clingo_grounding(lp, base)
+        derivable = [f for f in all_facts["true_facts"] if f not in set(base)]
+        if not derivable:
+            continue
+
+        obs = random.choice(derivable)
+        proof = determine_how_proved(lp, base, obs)
+        leaves = extract_abduction_hypotheses(proof)
+        if not leaves:
+            continue
+
+        # hide one leaf ⇒ that becomes our query
+        hidden_str = random.choice(leaves)
+        hidden_atom = next(a for a in base if a.to_asp().strip()==hidden_str)
+
+        # rebuild context = (base ∪ {obs}) \ {hidden_atom}
+        ctx = [a for a in base if a != hidden_atom] + [obs]
+
+        q_asp   = hidden_atom.to_asp()
+        c_asp   = lp.to_asp() + "\n" + "\n".join(a.to_asp() for a in ctx)
+        prompt  = generate_abduction_prompt(lp, ctx, hidden_atom)
+        return q_asp, c_asp, prompt, "YES"
+
+    raise RuntimeError("Could not generate a YES abduction task")
+
+
+def _make_abduction_no_task(config: Dict[str,Any]) -> Tuple[str,str,str,str]:
+    """
+    Force a NO-case:
+      • pick a derivable target `obs`
+      • hide a fact *not* among its leaf premises
+      • context includes all other base–facts + `obs`
+      • query is the hidden, irrelevant fact
+      • t = "NO"
+    """
+    for _ in range(200):
+        lp   = generate_logic_program(config)
+        base = generate_base_facts(lp, config["num_base_facts"])
+        all_facts = clingo_grounding(lp, base)
+        derivable = [f for f in all_facts["true_facts"] if f not in set(base)]
+        if not derivable:
+            continue
+
+        obs = random.choice(derivable)
+        proof = determine_how_proved(lp, base, obs)
+        leaves = set(extract_abduction_hypotheses(proof))
+
+        ctx = base + [obs]
+        non_leaves = [a for a in ctx if a.to_asp().strip() not in leaves]
+        if not non_leaves:
+            continue
+
+        hidden_atom = random.choice(non_leaves)
+        ctx_minus    = [a for a in ctx if a != hidden_atom]
+
+        q_asp   = hidden_atom.to_asp()
+        c_asp   = lp.to_asp() + "\n" + "\n".join(a.to_asp() for a in ctx_minus)
+        prompt  = generate_abduction_prompt(lp, ctx_minus, hidden_atom)
+        return q_asp, c_asp, prompt, "NO"
+
+    raise RuntimeError("Could not generate a NO abduction task")
+
+
+def generate_abduction_task(
+    config: Dict[str,Any],
+    yes_prob: float = 0.5
+) -> Tuple[str,str,str,str]:
+    """
+    With probability yes_prob build a YES case, otherwise a NO case.
+    """
+    if random.random() < yes_prob:
+        return _make_abduction_yes_task(config)
+    else:
+        return _make_abduction_no_task(config)
+
+
+def build_abduction_benchmark(
+    n: int,
+    config: Dict[str,Any],
+    out_path: str,
+    yes_prob: float = 0.5
+):
+    """
+    Generate *n* abduction tasks by sampling YES/NO according to yes_prob,
+    rather than enforcing an exact split.
+    """
+    tasks = []
+    for _ in range(n):
+        q, c, prompt, t = generate_abduction_task(config, yes_prob=yes_prob)
+        tasks.append({"q":q, "c":c, "prompt":prompt, "t":t})
+    random.shuffle(tasks)
+    with open(out_path, "w") as f:
+        json.dump(tasks, f, indent=2)
+    print(f"Wrote {len(tasks)} abduction tasks to {out_path}")
+
 
 if __name__ == "__main__":
     n = 500
     build_deduction_benchmark(n, config=CONFIG, out_path="deduction_benchmark_1.json")
     print(f"Wrote {n} deduction examples to deduction_benchmark_1.json")
 
-
-
-
-def build_full_benchmark(out_path, examples_per=2, max_tries=200):
-    bench = []
-    for nr, nf, mb, dd in itertools.product(range(4,5), range(4,5), range(2,3), [0,1,2,3]):
-        config = {
-          **CONFIG,
-          "num_rules":       nr,
-          "num_base_facts":  nf,
-          "max_body_length": mb,
-          # set min_proof_depth=0 to allow ANY derivable
-          "min_proof_depth": 0,
-        }
-        found = []
-        tries = 0
-        while len(found) < examples_per and tries < max_tries:
-            q,c,t,depth = generate_deduction_task(config)
-            d_norm = 0 if t=="NO" else depth
-            if d_norm == dd and not any(x["q"]==q and x["c"]==c for x in found):
-                found.append({"q":q,"c":c,"t":t,"depth":d_norm,
-                              "params": (nr,nf,mb)})
-            tries += 1
-
-        if len(found) < examples_per:
-            tqdm.write(f"Only {len(found)}/{examples_per} for"
-                       f" (rules={nr},facts={nf},body={mb},depth={dd})")
-        bench.extend(found)
-
-    with open(out_path, "w") as f:
-        json.dump(bench, f, indent=2)
-    print(f"Wrote {len(bench)} tasks to {out_path}")
-
-# if __name__=="__main__":
-#     build_full_benchmark("deduction_benchmark_final.json")
+    build_abduction_benchmark(n, config=CONFIG, out_path="abduction_benchmark.json")
+    print(f"Wrote {n} abduction examples to abduction_benchmark.json")
