@@ -7,7 +7,6 @@ from itertools import product
 
 # Consts & Logging
 
-VAR_NAMES: List[str] = list("XYZWABCDE")
 RETRY_LIMIT: int = 200
 
 logging.basicConfig(level=logging.INFO)
