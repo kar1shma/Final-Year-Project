@@ -522,7 +522,6 @@ def generate_deduction_prompt(
     Generate a natural language prompt for deduction tasks.
     """
     displayed = list(program.rules)
-    random.shuffle(displayed)
     rules = [r.to_nl() for r in displayed]
     facts = [f"{a.to_nl()}." for a in base]
     return (
@@ -542,7 +541,6 @@ def generate_abduction_prompt(
     Generate a natural language prompt for abduction tasks.
     """
     displayed = list(program.rules)
-    random.shuffle(displayed)
     rules = [r.to_nl() for r in displayed]
     facts = [f"{a.to_nl()}." for a in base]
     return (
