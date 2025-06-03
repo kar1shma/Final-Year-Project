@@ -1,6 +1,7 @@
 import json
 import argparse
 from tqdm import tqdm
+import random
 
 import torch
 from transformers import (
@@ -10,18 +11,34 @@ from transformers import (
 )
 
 
-def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int = 8):
-    
-	# check device
+def shuffle_rules_in_prompt(nl_prompt: str) -> str:
+    lines = nl_prompt.splitlines()
+    split_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == "" and i + 1 < len(lines) and lines[i + 1].startswith("And the following facts:"):
+            split_idx = i
+            break
+    if split_idx is None:
+        return nl_prompt
+
+    header = lines[:1]
+    rule_lines = lines[1:split_idx]
+    footer = lines[split_idx:]
+    random.shuffle(rule_lines)
+    return "\n".join(header + rule_lines + footer)
+
+
+def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int = 8, shuffle_rules: bool = False):
+    # Determine if gpu available
     device = 0 if torch.cuda.is_available() else -1
 
-    # Load tokeniser and model
-    print(f"Loading tokenizer and model for {model_id}…")
+    # Load tokeniser + model
+    print(f"Loading tokeniser and model for {model_id}…")
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
     model.to(device)
 
-    # build a text2text‐generation pipeline.
+    # Create a text2text-generation pipeline
     print("Creating text2text-generation pipeline…")
     generator = pipeline(
         task="text2text-generation",
@@ -30,12 +47,19 @@ def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int 
         device=device,
     )
 
-    # extract all prompts into a list
-    prompts = [t["natural language"].strip() for t in tasks]
+    # Build list of (possibly‐shuffled) prompts
+    prompts = []
+    for t in tasks:
+        base_prompt = t["natural language"].strip()
+        if shuffle_rules:
+            prompts.append(shuffle_rules_in_prompt(base_prompt))
+        else:
+            prompts.append(base_prompt)
+
     total_prompts = len(prompts)
     print(f"Will generate {total_prompts} outputs in batches of {batch_size}…")
 
-    # for each chunk of size batch_size, call the pipeline
+    # Generate in mini‐batches
     all_generated_texts = []
     n_chunks = (total_prompts + batch_size - 1) // batch_size
 
@@ -44,25 +68,21 @@ def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int 
         end = min(start + batch_size, total_prompts)
         batch_prompts = prompts[start:end]
 
-        # call the generator on this mini‐batch
         outputs = generator(
             batch_prompts,
             max_new_tokens=256,
             num_beams=4,
             do_sample=False,
         )
-        # collect the generated_text for each element
         for out in outputs:
             all_generated_texts.append(out["generated_text"].strip())
 
     assert len(all_generated_texts) == total_prompts
 
-    # parse each generated_text as json and compare to ground truth
+    # Parse each generated_text as JSON, compare to ground truth
     results = []
     for idx, task in enumerate(tqdm(tasks, desc="Parsing outputs")):
         generated = all_generated_texts[idx]
-
-        # attempt to parse JSON
         try:
             parsed = json.loads(generated)
             pred_answer = parsed.get("answer", "").strip()
@@ -71,7 +91,6 @@ def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int 
             pred_answer = "ERROR"
             pred_rationale = generated
 
-        # Combine metadata + gold label + prediction
         rec = {
             **task["metadata"],
             "gold": task["t"],
@@ -83,7 +102,6 @@ def run_hf_inference(model_id: str, tasks: list, out_path: str, batch_size: int 
     print(f"Writing {len(results)} records to {out_path} …")
     with open(out_path, "w") as fout:
         json.dump(results, fout, indent=2)
-
     print("Done.")
 
 
@@ -102,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out",
         required=True,
-        help="Output file path (e.g. flan_t5_xl_results.json)."
+        help="Output file path (e.g. flan_t5_xl_unshuffled.json)."
     )
     parser.add_argument(
         "--batch_size",
@@ -110,10 +128,31 @@ if __name__ == "__main__":
         default=8,
         help="How many prompts to generate at once (default: 8)."
     )
+    parser.add_argument(
+        "--shuffle_rules",
+        action="store_true",
+        help="If set, shuffle the rule‐lines in each prompt before generation."
+    )
+
     args = parser.parse_args()
 
-    # load all tasks from the provided JSON file
+    # Load tasks from JSON
     tasks_list = json.load(open(args.tasks, "r"))
 
-    # run inference and save outputs
-    run_hf_inference(args.model_id, tasks_list, args.out, batch_size=args.batch_size)
+    # Run inference + save outputs
+    run_hf_inference(
+        model_id=args.model_id,
+        tasks=tasks_list,
+        out_path=args.out,
+        batch_size=args.batch_size,
+        shuffle_rules=args.shuffle_rules
+    )
+
+
+# Usage example:
+# python hf_eval.py \
+#   --model_id google/flan-t5-xl \
+#   --tasks benchmark.json \
+#   --out flan_t5_shuffled.json \
+#   --batch_size 8 \
+#   --shuffle_rules

@@ -554,32 +554,6 @@ def generate_abduction_prompt(
     )
 
 
-def shuffle_rules_in_prompt(nl_prompt: str) -> str:
-    """
-    Given an existing Natural Language prompt that begins with:
-    shuffle only the <rule lines> block and rebuild the prompt.
-    It assumes the NL prompt always follows exactly the format emitted by our generator.
-    """
-    lines = nl_prompt.splitlines()
-    # We look for the blank line preceding “And the following facts:”
-    idx = None
-    for i, line in enumerate(lines):
-        if line.strip() == "" and i + 1 < len(lines) and lines[i + 1].startswith("And the following facts:"):
-            idx = i
-            break
-    if idx is None:
-        # If formatting changed, just return the original
-        return nl_prompt
-
-    header = lines[:1]  # "You are given the following information:"
-    rule_lines = lines[1:idx]  # all the r.to_nl() lines
-    footer = lines[idx:]  # from "" and "And the following facts:" onward
-
-    random.shuffle(rule_lines)
-    new_lines = header + rule_lines + footer
-    return "\n".join(new_lines)
-
-
 
 # Main driver: sweeping diverse configs
 if __name__ == "__main__":
