@@ -106,20 +106,25 @@ if __name__ == "__main__":
     results = []
 
     # Iterate and call the model
-    for idx, t in enumerate(tqdm(tasks, desc="llama2")):
-        base_prompt = t["natural language"]
+    for idx, task in enumerate(tqdm(tasks, desc="llama2")):
+        resp = evaluator(task["natural language"])
+        tqdm.write(f"#{idx:04d} → answer={resp.answer!r}")
+
+        base_prompt = task["natural language"]
         if args.shuffle_rules:
             prompt_to_model = shuffle_rules_in_prompt(base_prompt)
         else:
             prompt_to_model = base_prompt
 
-        resp = evaluator(prompt_to_model)
-        tqdm.write(f"#{idx:03d} → answer={resp.answer!r}")
-        results.append({
-            **t["metadata"],
-            "pred": resp.answer,
-            "gold": t["t"],
-        })
+        new_entry = {
+            "q": task["q"],
+            "c": task["c"],
+            "natural language": task["natural language"],
+            "t": task["t"],
+            "metadata": task["metadata"],
+            "pred": resp.answer
+        }
+        results.append(new_entry)
 
     # Write a single JSON array containing all result‐objects
     with open(args.out, "w") as f:
