@@ -558,8 +558,8 @@ def generate_abduction_prompt(
 # Main driver: sweeping diverse configs
 if __name__ == "__main__":
     NUM_RULES      = [5, 15, 25, 35]
-    NUM_BASE_FACTS = [5, 10, 15, 20]
-    PROOF_DEPTHS   = [2, 6, 10, 14, 18, 22]
+    NUM_BASE_FACTS = [3, 6, 9, 12, 15]
+    PROOF_DEPTHS   = [1, 5, 10, 20, 30]
     RECURSION_OPTIONS = [True, False]
     TASKS_PER_GROUP = 5
     GROUPS_PER_CFG  = 1
