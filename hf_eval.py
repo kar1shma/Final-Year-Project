@@ -96,7 +96,7 @@ def run(model_id: str,
             "c": task["c"],
             "natural language": task["natural language"],
             "t": task["t"],
-            **task["metadata"],
+            "metadata": task["metadata"],
             "pred": ans,
             "rationale": rat,
         }
