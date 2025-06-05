@@ -171,8 +171,8 @@ PREDICATE_POOL: List[Predicate] = [
     Predicate("happy", 1, ["person"], "{0} is happy"),
     Predicate("hungry", 1, ["person"], "{0} is hungry"),
     Predicate("owns", 2, ["person", "object"], "{0} owns {1}"),
-    Predicate("likes", 2, ["person", "entity"], "{0} likes {1}"),
-    Predicate("dislikes", 2, ["person", "entity"], "{0} dislikes {1}"),
+    Predicate("likes", 2, ["person", "object"], "{0} likes {1}"),
+    Predicate("dislikes", 2, ["person", "object"], "{0} dislikes {1}"),
     Predicate("friend", 2, ["person", "person"], "{0} is a friend of {1}"),
     Predicate("enemy", 2, ["person", "person"], "{0} is an enemy of {1}"),
     Predicate("parent", 2, ["person", "person"], "{0} is a parent of {1}"),
@@ -182,21 +182,6 @@ PREDICATE_POOL: List[Predicate] = [
 CONSTANT_POOL: Dict[str, List[str]] = {
     "person": ["alice", "bob", "carol", "dave", "eve", "frank", "george"],
     "object": ["apple", "book", "ball", "car", "pencil", "phone"],
-    "entity": [
-        "alice",
-        "bob",
-        "carol",
-        "dave",
-        "eve",
-        "frank",
-        "george",
-        "apple",
-        "book",
-        "ball",
-        "car",
-        "pencil",
-        "phone",
-    ],
 }
 
 
@@ -583,7 +568,7 @@ if __name__ == "__main__":
             all_tasks.extend(ded)
             all_tasks.extend(abd)
 
-    with open("benchmark.json", "w") as f:
+    with open("propositional_benchmark.json", "w") as f:
         json.dump(all_tasks, f, indent=2)
-    print(f"Generated {len(all_tasks)} total tasks in benchmark.json")
+    print(f"Generated {len(all_tasks)} total tasks in propositional_benchmark.json")
 
