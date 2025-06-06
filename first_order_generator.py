@@ -131,10 +131,14 @@ PREDICATE_POOL: List[Predicate] = [
     Predicate("wet", 1, ["object"], "{0} is wet"),
     Predicate("big", 1, ["object"], "{0} is big"),
     Predicate("small", 1, ["object"], "{0} is small"),
+    Predicate("clean", 1, ["object"], "{0} is clean"),
+    Predicate("red", 1, ["object"], "{0} is red"),
     Predicate("sad", 1, ["person"], "{0} is sad"),
     Predicate("tall", 1, ["person"], "{0} is tall"),
     Predicate("happy", 1, ["person"], "{0} is happy"),
     Predicate("hungry", 1, ["person"], "{0} is hungry"),
+    Predicate("calm", 1, ["person"], "{0} is calm"),
+    Predicate("excited", 1, ["person"], "{0} is excited"),
     Predicate("owns", 2, ["person", "object"], "{0} owns {1}"),
     Predicate("likes", 2, ["person", "object"], "{0} likes {1}"),
     Predicate("dislikes", 2, ["person", "object"], "{0} dislikes {1}"),
@@ -180,6 +184,14 @@ def generate_base_facts(program: LogicProgram, num_facts: int) -> List[Atom]:
 # --------------------------
 # Helper: Generate Extra FOL Rules Without Shortcutting the Chain
 # --------------------------
+def _is_trivial(rule: Rule) -> bool:
+    # exactly p(X) :- p(X)
+    return (
+        len(rule.body)==1
+        and rule.head.predicate == rule.body[0].predicate
+        and rule.head.terms     == rule.body[0].terms
+    )
+
 def _generate_extra_fol_rules(
     num_extra: int,
     max_body_len: int,
@@ -260,6 +272,12 @@ def _generate_extra_fol_rules(
 
         extra_rules.append(Rule(head, body))
 
+        extra_rules = [
+            r for r in extra_rules
+            if r.body               # drop any Rule with body=[]
+            and not _is_trivial(r)
+        ]
+
     return extra_rules
 
 
@@ -267,88 +285,78 @@ def _generate_extra_fol_rules(
 def generate_fol_program(
     cfg: Dict[str, Any],
 ) -> Tuple[LogicProgram, List[Atom]]:
-    """
-    Build a first-order chain of length = proof_depth, ensuring final ≠ root.
-    """
-    d = cfg.get("proof_depth", 1)
+    d = cfg["proof_depth"]
+    # pick predicate pools
+    person_unary = [p for p in PREDICATE_POOL if p.arity==1 and p.arg_types[0]=="person"]
+    object_unary = [p for p in PREDICATE_POOL if p.arity==1 and p.arg_types[0]=="object"]
 
-    person_unary = [p for p in PREDICATE_POOL if p.arity == 1 and p.arg_types[0] == "person"]
-    object_unary = [p for p in PREDICATE_POOL if p.arity == 1 and p.arg_types[0] == "object"]
-
-    # 1) Pick root_pred and root_const
-    if random.random() < 0.5 and person_unary:
-        root_pred = random.choice(person_unary)
-        root_type = "person"
+    # 1) root predicate and constant
+    if random.random()<0.5 and person_unary:
+        root_pred, root_type = random.choice(person_unary), "person"
     else:
-        root_pred = random.choice(object_unary)
-        root_type = "object"
-
+        root_pred, root_type = random.choice(object_unary), "object"
     const = random.choice(CONSTANT_POOL[root_type])
     root_fact = Atom(root_pred, [const])
 
-    # 2) Build chain_seq = [root_pred, p1, p2, ..., pd], with pd != root_pred
-    if root_type == "person":
-        candidates = person_unary
-    else:
-        candidates = object_unary
-
+    # 2) build a non‐cyclic chain_seq of length d+1
+    candidates = person_unary if root_type=="person" else object_unary
     while True:
-        chain_seq: List[Predicate] = [root_pred]
+        chain_seq = [root_pred]
         for i in range(d):
-            if i == d - 1:
-                # last step: exclude root_pred
-                choices = [p for p in candidates if p != root_pred]
-                if not choices:
-                    # fallback if only one unary, allow it (rare)
-                    choices = candidates
+            if cfg["allow_recursion"]:
+                banned = {chain_seq[-1]}
+                if i==d-1: banned.add(root_pred)
             else:
-                choices = candidates
-            pick = random.choice(choices)
-            chain_seq.append(pick)
-        # Ensure final head ≠ root_pred
-        if chain_seq[-1] != root_pred:
+                banned = set(chain_seq)
+            choices = [p for p in candidates if p not in banned] or candidates
+            chain_seq.append(random.choice(choices))
+        if chain_seq[-1]!=root_pred:
             break
 
-    # 3) Turn chain_seq into chain_rules
-    chain_rules: List[Rule] = []
-    for i in range(1, len(chain_seq)):
-        head_pred = chain_seq[i]
-        prev_pred = chain_seq[i - 1]
-        head = Atom(head_pred, ["X"])
-        body = [Atom(prev_pred, ["X"])]
-        chain_rules.append(Rule(head, body))
+    # 3) chain rules
+    chain_rules = [
+        Rule(Atom(chain_seq[i],["X"]), [Atom(chain_seq[i-1],["X"])])
+        for i in range(1, len(chain_seq))
+    ]
 
-    # 4) Extra rules whose heads do NOT use any predicate in chain_seq
-    chain_pred_names = {p.name for p in chain_seq}
-    total_rules = cfg.get("num_rules", 0)
-    num_extra = max(total_rules - len(chain_rules), 0)
-    extra_rules = _generate_extra_fol_rules(
-        num_extra, cfg.get("max_body_length", 1), chain_pred_names
-    )
+    # 4) sample exactly num_extra non‐trivial, non‐recursive, unique extras
+    num_extra = cfg["num_rules"] - len(chain_rules)
+    extra_rules, seen, attempts = [], set(), 0
+    while len(extra_rules)<num_extra and attempts<RETRY_LIMIT:
+        attempts += 1
+        for r in _generate_extra_fol_rules(1, cfg["max_body_length"], {p.name for p in chain_seq}):
+            key = repr(r)
+            if (
+                r.body
+                and not _is_trivial(r)
+                and (cfg["allow_recursion"] or r.head.predicate not in {b.predicate for b in r.body})
+                and len(r.body) <= cfg["max_body_length"]
+                and key not in seen
+            ):
+                seen.add(key)
+                extra_rules.append(r)
+            if len(extra_rules)==num_extra:
+                break
 
     prog = LogicProgram(chain_rules + extra_rules)
 
-    # 5) Base facts = [root_fact] + random others not using chain predicates
-    other_preds = [p for p in PREDICATE_POOL if p.name not in chain_pred_names]
-    atoms: Set[Atom] = set()
+    # 5) base facts
+    other_preds = [p for p in PREDICATE_POOL if p.name not in {p.name for p in chain_seq}]
+    atoms = set()
     for p in other_preds:
-        if p.arity == 0:
-            atoms.add(Atom(p, []))
-        elif p.arity == 1:
-            typ = p.arg_types[0]
-            for c in CONSTANT_POOL.get(typ, []):
-                atoms.add(Atom(p, [c]))
+        if p.arity==0:
+            atoms.add(Atom(p,[]))
+        elif p.arity==1:
+            for c in CONSTANT_POOL[p.arg_types[0]]:
+                atoms.add(Atom(p,[c]))
         else:
-            for c1 in CONSTANT_POOL.get(p.arg_types[0], []):
-                for c2 in CONSTANT_POOL.get(p.arg_types[1], []):
-                    if c1 != c2:
-                        atoms.add(Atom(p, [c1, c2]))
-
-    other_base = random.sample(
-        list(atoms),
-        min(cfg.get("num_base_facts", 1) - 1, len(atoms))
-    )
+            for c1 in CONSTANT_POOL[p.arg_types[0]]:
+                for c2 in CONSTANT_POOL[p.arg_types[1]]:
+                    if c1!=c2:
+                        atoms.add(Atom(p,[c1,c2]))
+    other_base = random.sample(list(atoms), min(cfg["num_base_facts"]-1, len(atoms)))
     base = [root_fact] + other_base
+
     return prog, base
 
 
@@ -533,7 +541,7 @@ def generate_multiple_deduction_tasks(
     base: List[Atom],
     config: Dict[str, Any],
     n: int,
-    yes_ratio: float = 0.5,
+    yes_ratio: float = 0.9,
 ) -> List[Dict[str, Any]]:
     grounded = clingo_grounding(program, base)
     true_facts = grounded["true_facts"]
@@ -581,7 +589,7 @@ def generate_multiple_abduction_tasks(
     base: List[Atom],
     config: Dict[str, Any],
     n: int,
-    yes_ratio: float = 0.5,
+    yes_ratio: float = 0.9,
 ) -> List[Dict[str, Any]]:
     """
     Strict “mirror‐of‐deduction” abduction:
@@ -725,7 +733,7 @@ def generate_abduction_prompt(
     rules_nl = [r.to_nl() for r in program.rules]
     facts_nl = [f"{a.to_nl()}." for a in ctx]
     return (
-        "You are given the following rules:\n"
+        "You are given the following information:\n"
         + "\n".join(rules_nl)
         + "\n\nAnd the following facts:\n"
         + "\n".join(facts_nl)
@@ -739,7 +747,7 @@ def generate_abduction_prompt(
 # --------------------------
 if __name__ == "__main__":
     NUM_RULES      = [5, 15, 25, 35]
-    NUM_BASE_FACTS = [3, 6, 9, 12, 15]
+    NUM_BASE_FACTS = [4, 8, 12, 16, 20]
     PROOF_DEPTHS   = [1, 5, 10, 20, 30]
     RECURSION_OPTIONS = [True, False]
     TASKS_PER_GROUP = 5
