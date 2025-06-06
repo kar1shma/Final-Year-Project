@@ -192,6 +192,7 @@ def _generate_extra_fol_rules(
             break
         head_pred = random.choice(available_preds)
 
+        # Build a fresh variable‐to‐type map for the head
         var_map: Dict[str, str] = {}
         head_vars: List[str] = []
         for typ in head_pred.arg_types:
@@ -203,13 +204,15 @@ def _generate_extra_fol_rules(
         head = Atom(head_pred, head_vars)
 
         body: List[Atom] = []
+
+        # (1) One body atom per variable in var_map, ensuring no reflexive (X, X) for arity=2
         for v, typ in var_map.items():
-            candidates = [
-                p for p in available_preds if typ in p.arg_types and p.arity >= 1
-            ]
+            candidates = [p for p in available_preds if typ in p.arg_types and p.arity >= 1]
             if not candidates:
                 continue
             p = random.choice(candidates)
+
+            # Build terms for p, placing v in one slot and a different var in the other (if possible)
             terms: List[str] = []
             placed = False
             for arg_type in p.arg_types:
@@ -217,19 +220,48 @@ def _generate_extra_fol_rules(
                     terms.append(v)
                     placed = True
                 else:
-                    terms.append(random.choice(list(var_map.keys())))
+                    other_vars = [u for u in var_map.keys() if u != v]
+                    if other_vars:
+                        terms.append(random.choice(other_vars))
+                    else:
+                        # Only v is available; this would be reflexive, so skip
+                        terms.append(v)
+
+            # If p is binary and ended up with ["X", "X"], skip this body atom
+            if p.arity == 2 and len(terms) == 2 and terms[0] == terms[1]:
+                continue
+
             body.append(Atom(p, terms))
 
+        # (2) Add up to max_body_len more random body atoms, again avoiding (X, X)
         extra_len = random.randint(0, max_body_len)
         for _ in range(extra_len):
             p = random.choice(available_preds)
             if not var_map:
                 break
-            terms = [random.choice(list(var_map.keys())) for _ in p.arg_types]
+
+            if p.arity == 2:
+                # Pick two distinct variables if possible
+                vars_list = list(var_map.keys())
+                if len(vars_list) < 2:
+                    # Cannot form a non‐reflexive binary atom, so skip
+                    continue
+                v1, v2 = random.sample(vars_list, k=2)
+                terms = [v1, v2]
+            else:
+                # Unary or zero‐ary: sample normally
+                terms = [random.choice(list(var_map.keys())) for _ in p.arg_types]
+
+            # Double‐check reflexive case for binary
+            if p.arity == 2 and terms[0] == terms[1]:
+                continue
+
             body.append(Atom(p, terms))
 
         extra_rules.append(Rule(head, body))
+
     return extra_rules
+
 
 
 def generate_inductive_fol(
@@ -323,13 +355,91 @@ def generate_inductive_fol(
 # --------------------------
 # Clingo Grounding & Proof Discovery
 # --------------------------
+# --------------------------
+# Helper: Fully Ground a First‐Order Program (Robust to Type Conflicts)
+# --------------------------
+def _ground_rule(rule: Rule) -> List[Rule]:
+    """
+    Given one Rule (potentially containing variables), return a list of fully ground Rule instances
+    by substituting every variable with all constants of the appropriate type.  If a single variable
+    is used in positions with conflicting types, we drop that rule entirely (return an empty list).
+    """
+    # 1) Collect all variables and record their types.
+    var_types: Dict[str, str] = {}
+
+    def _collect_from_atom(atom: Atom):
+        for idx, term in enumerate(atom.terms):
+            # If this term is a “variable” (starts with uppercase letter), note its required type:
+            if term and term[0].isupper():
+                expected_type = atom.predicate.arg_types[idx]
+                if term in var_types:
+                    # If we've already seen this var, its type must match:
+                    if var_types[term] != expected_type:
+                        # Conflict: same var name used with different arg_types → drop rule
+                        raise RuntimeError(f"Type mismatch for variable {term}")
+                else:
+                    var_types[term] = expected_type
+
+    try:
+        # Collect variable types from head and body:
+        _collect_from_atom(rule.head)
+        for b in rule.body:
+            _collect_from_atom(b)
+    except RuntimeError:
+        # A type‐mismatch occurred; discard this rule entirely.
+        return []
+
+    # 2) If no variables, the rule is already ground:
+    if not var_types:
+        return [rule]
+
+    # 3) Build the domain for each variable (cartesian product):
+    var_names = list(var_types.keys())
+    var_domains = [CONSTANT_POOL[var_types[v]] for v in var_names]
+
+    ground_rules: List[Rule] = []
+    for assignment in product(*var_domains):
+        sub_map = {var_names[i]: assignment[i] for i in range(len(var_names))}
+
+        def _instantiate_atom(atom: Atom) -> Atom:
+            if atom.predicate.arity == 0:
+                return Atom(atom.predicate, [])
+            new_terms = []
+            for t in atom.terms:
+                if t and t[0].isupper():  # a variable
+                    new_terms.append(sub_map[t])
+                else:
+                    new_terms.append(t)
+            return Atom(atom.predicate, new_terms)
+
+        ground_head = _instantiate_atom(rule.head)
+        ground_body = [_instantiate_atom(b) for b in rule.body]
+        ground_rules.append(Rule(ground_head, ground_body))
+
+    return ground_rules
+
+
 def clingo_grounding(
     program: LogicProgram, base_facts: List[Atom]
 ) -> Dict[str, Set[Atom]]:
-    asp_rules = program.to_asp()
+    """
+    Replace every variable‐containing rule with all its ground instantiations (using _ground_rule).
+    Any rule that fails to ground (type conflict) is simply dropped. Then call Clingo on the
+    resulting purely ground program + base_facts. Returns {"true_facts", "false_facts"}.
+    """
+    all_ground_rules: List[Rule] = []
+    for r in program.rules:
+        grounded_list = _ground_rule(r)
+        # _ground_rule returns [] if there was a type conflict → effectively skips that rule
+        all_ground_rules.extend(grounded_list)
+
+    # Serialize the “clean” ground rules and base_facts:
+    asp_rules = "\n".join(r.to_asp() for r in all_ground_rules)
     asp_facts = "\n".join(a.to_asp() for a in base_facts)
-    preds = {r.head.predicate for r in program.rules} | {
-        b.predicate for r in program.rules for b in r.body
+
+    # Collect all predicates that appear in these ground rules:
+    preds = {r.head.predicate for r in all_ground_rules} | {
+        b.predicate for r in all_ground_rules for b in r.body
     }
     shows = "\n".join(f"#show {p.name}/{p.arity}." for p in preds)
 
@@ -340,25 +450,35 @@ def clingo_grounding(
     true_strs: Set[str] = set()
     ctl.solve(on_model=lambda m: true_strs.update(str(x) for x in m.symbols(shown=True)))
 
+    # Parse true atoms back into Atom objects
     true_atoms: Set[Atom] = set()
     for s in true_strs:
         if "(" in s:
-            n, args = s.split("(", 1)
+            name, args = s.split("(", 1)
             args = args.rstrip(")").split(",")
-            p = next(
-                (pp for pp in PREDICATE_POOL if pp.name == n and pp.arity == len(args)),
-                None,
-            )
+            p = next((pp for pp in PREDICATE_POOL if pp.name == name and pp.arity == len(args)), None)
             if p:
                 true_atoms.add(Atom(p, args))
         else:
-            p = next(
-                (pp for pp in PREDICATE_POOL if pp.name == s and pp.arity == 0), None
-            )
+            p = next((pp for pp in PREDICATE_POOL if pp.name == s and pp.arity == 0), None)
             if p:
                 true_atoms.add(Atom(p, []))
 
-    all_atoms = get_all_ground_atoms(program)
+    # Build the full Herbrand base for these predicates so we know which are false:
+    all_atoms: Set[Atom] = set()
+    for p in preds:
+        if p.arity == 0:
+            all_atoms.add(Atom(p, []))
+        elif p.arity == 1:
+            for c in CONSTANT_POOL[p.arg_types[0]]:
+                all_atoms.add(Atom(p, [c]))
+        else:  # arity == 2
+            typ1, typ2 = p.arg_types
+            for c1 in CONSTANT_POOL[typ1]:
+                for c2 in CONSTANT_POOL[typ2]:
+                    if c1 != c2:
+                        all_atoms.add(Atom(p, [c1, c2]))
+
     false_atoms = all_atoms - true_atoms
     return {"true_facts": true_atoms, "false_facts": false_atoms}
 
