@@ -264,7 +264,7 @@ def _generate_extra_fol_rules(
 
 
 
-def generate_inductive_fol(
+def generate_fol_program(
     cfg: Dict[str, Any],
 ) -> Tuple[LogicProgram, List[Atom]]:
     """
@@ -758,7 +758,7 @@ if __name__ == "__main__":
             "num_base_facts":   nb,
         }
         for _ in range(GROUPS_PER_CFG):
-            prog, base = generate_inductive_fol(cfg)
+            prog, base = generate_fol_program(cfg)
             ded_tasks = generate_multiple_deduction_tasks(prog, base, cfg, TASKS_PER_GROUP)
             abd_tasks = generate_multiple_abduction_tasks(prog, base, cfg, TASKS_PER_GROUP)
             all_tasks.extend(ded_tasks)
