@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class Predicate:
     """
-    A logical predicate symbol with fixed arity and argument-type constraints.
+    A logical predicate symbol with fixed arity and argument‐type constraints.
     - name: e.g. "parent", "wet", "sunny"
     - arity: number of arguments
     - arg_types: for each argument position, which types are allowed
@@ -31,11 +31,9 @@ class Predicate:
     ):
         self.name: str = name
         self.arity: int = arity
-        # Default to ["any", "any", ...] if no arg_types provided:
         self.arg_types: List[str] = (
             arg_types if arg_types is not None else ["any"] * arity
         )
-        # If no template given, build a minimal default based on arity:
         self.nl_template: str = (
             nl_template if nl_template is not None else self._default_template()
         )
@@ -45,12 +43,10 @@ class Predicate:
             return f"it is {self.name}"
         if self.arity == 1:
             return f"{{0}} is {self.name}"
-        # For arity >= 2, we produce "pred({0},{1},...,{arity-1})"
         placeholders = ", ".join(f"{{{i}}}" for i in range(self.arity))
         return f"{self.name}({placeholders})"
 
     def __repr__(self) -> str:
-        # Represented as "name/arity", e.g. "parent/2" or "sunny/0"
         return f"{self.name}/{self.arity}"
 
 
@@ -72,19 +68,13 @@ class Atom:
     def __repr__(self) -> str:
         if self.predicate.arity == 0:
             return self.predicate.name
-        # Join the term-names with commas
         term_str = ",".join(self.terms)
         return f"{self.predicate.name}({term_str})"
 
     def to_asp(self) -> str:
-        """Return the ASP-style string with a trailing period (e.g. 'sunny.')."""
         return f"{self}."
 
     def to_nl(self) -> str:
-        """Fill in the predicate's nl_template using each term."""
-        # If arity=0, nl_template might be "it is sunny"
-        # If arity=1, e.g. "{0} is happy"
-        # If arity=2, e.g. "{0} owns {1}"
         return self.predicate.nl_template.format(*self.terms)
 
     def __eq__(self, other: Any) -> bool:
@@ -111,24 +101,16 @@ class Rule:
     def __repr__(self) -> str:
         if self.is_fact():
             return f"{self.head}."
-        # Join all body terms via ", "
         body_str = ", ".join(str(b) for b in self.body)
         return f"{self.head} :- {body_str}."
 
     def to_asp(self) -> str:
-        """Return the ASP clause exactly as repr(self)."""
         return repr(self)
 
     def to_nl(self) -> str:
-        """
-        Return a short English sentence.
-        If fact: "<head in English>."
-        Else: "If <body1 in English> and <body2 in English>, then <head in English>."
-        """
         head_nl = self.head.to_nl()
         if self.is_fact():
             return f"{head_nl}."
-        # Build "body1_nl, body2_nl, …"
         conds_nl = " and ".join(b.to_nl() for b in self.body)
         return f"If {conds_nl}, then {head_nl}."
 
@@ -146,14 +128,9 @@ class LogicProgram:
         return iter(self.rules)
 
     def to_asp(self) -> str:
-        """
-        Concatenate all rules into a single ASP program string.
-        Each rule ends with a period, so we just join on newline.
-        """
         return "\n".join(r.to_asp() for r in self.rules)
 
     def add_rule(self, rule: Rule) -> None:
-        """Append a new Rule to this program."""
         self.rules.append(rule)
 
 
@@ -187,13 +164,12 @@ CONSTANT_POOL: Dict[str, List[str]] = {
 
 def generate_logic_program(config: Dict[str, Any]) -> LogicProgram:
     """
-    Generate a random LogicProgram of ground (variable-free) Horn rules according to config.
+    Generate a random LogicProgram of ground (variable‐free) Horn rules according to config.
     All terms are constants to ensure safe grounding.
     """
     rules: List[Rule] = []
     usage: Dict[Predicate, int] = {}
     for _ in range(config.get("num_rules", 0)):
-        # choose head predicate
         if usage and random.random() < 0.5:
             cands = [
                 p for p, c in usage.items() if c < config.get("branching_factor", 1)
@@ -201,18 +177,14 @@ def generate_logic_program(config: Dict[str, Any]) -> LogicProgram:
             head_pred = random.choice(cands) if cands else random.choice(PREDICATE_POOL)
         else:
             head_pred = random.choice(PREDICATE_POOL)
-        # ground head terms
         head_terms: List[str] = []
         for typ in head_pred.arg_types:
             choices = CONSTANT_POOL.get(typ, [])
             const = (
-                random.choice(choices)
-                if choices
-                else random.choice(sum(CONSTANT_POOL.values(), []))
+                random.choice(choices) if choices else random.choice(sum(CONSTANT_POOL.values(), []))
             )
             head_terms.append(const)
         head = Atom(head_pred, head_terms)
-        # build body of ground atoms
         body: List[Atom] = []
         length = random.randint(1, config.get("max_body_length", 1))
         for _ in range(length):
@@ -225,9 +197,7 @@ def generate_logic_program(config: Dict[str, Any]) -> LogicProgram:
             for typ in pred.arg_types:
                 choices = CONSTANT_POOL.get(typ, [])
                 const = (
-                    random.choice(choices)
-                    if choices
-                    else random.choice(sum(CONSTANT_POOL.values(), []))
+                    random.choice(choices) if choices else random.choice(sum(CONSTANT_POOL.values(), []))
                 )
                 terms.append(const)
             body.append(Atom(pred, terms))
@@ -319,16 +289,15 @@ def determine_how_proved(
         for i, r in enumerate(program.rules):
             if r.is_fact():
                 continue
-            for g in [r]:
-                if all(b in known for b in g.body):
-                    h = g.head
-                    if h not in known:
-                        new.add(h)
-                        der_rules[str(h)] = {
-                            "rule_idx": i,
-                            "body_atoms": [str(b) for b in g.body],
-                        }
-                        set_depth[str(h)] = depth + 1
+            if all(b in known for b in r.body):
+                h = r.head
+                if h not in known:
+                    new.add(h)
+                    der_rules[str(h)] = {
+                        "rule_idx": i,
+                        "body_atoms": [str(b) for b in r.body],
+                    }
+                    set_depth[str(h)] = depth + 1
         if not new:
             break
         depth += 1
@@ -356,10 +325,8 @@ def generate_inductive_program(
     d = config.get("proof_depth", 1)
     chain_rules: List[Rule] = []
 
-    # Build a ground chain: each head uses constants, not variables
     prev_head: Optional[Atom] = None
-    for i in range(d + 1):  # chain length = proof_depth + 1
-        # pick a predicate and ground terms
+    for i in range(d + 1):
         p = random.choice(PREDICATE_POOL)
         terms: List[str] = []
         for typ in p.arg_types:
@@ -370,13 +337,10 @@ def generate_inductive_program(
         chain_rules.append(Rule(head, body))
         prev_head = head
 
-    # Adjust remaining rules count
     remaining = max(config.get("num_rules", 0) - len(chain_rules), 0)
     rnd_cfg = {**config, "num_rules": remaining}
 
-    # Generate rest of the program
     rest_prog = generate_logic_program(rnd_cfg)
-    # Separate root of chain as a base fact
     chain_rule_facts = chain_rules[:1]
     chain_inference = chain_rules[1:]
 
@@ -390,18 +354,16 @@ def generate_inductive_program(
     return program, base_facts
 
 
-# Use generate_inductive_program to build n deduction tasks
 def generate_multiple_deduction_tasks(
     program: LogicProgram,
     base: List[Atom],
     config: Dict[str, Any],
     n: int,
-    yes_ratio: float = 0.6,
+    yes_ratio: float = 0.5,
 ) -> List[Dict[str, Any]]:
     """
     Build exactly n deduction tasks, half YES and half NO (up to rounding).
     """
-    # Compute derivability once
     grounded = clingo_grounding(program, base)
     proofs = {
         atom: determine_how_proved(program, base, atom)
@@ -410,18 +372,16 @@ def generate_multiple_deduction_tasks(
     yes_pool = [a for a, info in proofs.items() if info["derivable"]]
     no_pool = list(grounded["false_facts"])
 
-    # Decide counts
     num_yes = int(n * yes_ratio)
     num_no = n - num_yes
 
-    # Sample without replacement
     yes_samples = random.sample(yes_pool, min(num_yes, len(yes_pool)))
     no_samples = random.sample(no_pool, min(num_no, len(no_pool)))
 
     tasks = []
     for target in yes_samples + no_samples:
-        label = "YES" if target in yes_samples else "NO"
-        depth = config["proof_depth"] if label == "YES" else "not applicable"
+        label = "true" if target in yes_samples else "false"
+        depth = config["proof_depth"] if label == "true" else "not applicable"
         q = target.to_asp().strip()
         c = program.to_asp() + "\n" + "\n".join(a.to_asp() for a in base)
         nl = generate_deduction_prompt(program, base, target)
@@ -452,52 +412,128 @@ def extract_abduction_hypotheses(proof_info: Dict[str, Any]) -> List[str]:
     return list(leaves)
 
 
+def is_explanation(program: LogicProgram, context: List[Atom], hypothesis: Atom, conclusion: Atom) -> bool:
+    """
+    Check if adding hypothesis to context makes conclusion derivable, but without hypothesis it's not.
+    """
+    without = clingo_grounding(program, context)
+    if conclusion in without["true_facts"]:
+        return False
+    with_h = clingo_grounding(program, context + [hypothesis])
+    return conclusion in with_h["true_facts"]
+
+
 def generate_multiple_abduction_tasks(
     program: LogicProgram,
     base: List[Atom],
     config: Dict[str, Any],
     n: int,
-    yes_ratio: float = 0.6,
+    yes_ratio: float = 0.5,
 ) -> List[Dict[str, Any]]:
     """
-    Build exactly n abduction tasks, half YES and half NO (up to rounding).
+    Generate abductive reasoning tasks: some “true” (h really explains the conclusion)
+    and some “false” (h does not explain). We ensure false examples by dropping a
+    genuine used base fact and then showing a non‐used fact cannot recover the chain.
     """
-    d = config["proof_depth"]
-    obs = program.rules[d - 1].head
-    info = determine_how_proved(program, base, obs)
-    leaves = set(extract_abduction_hypotheses(info)) or {
-        a.to_asp().rstrip(".") for a in base
-    }
 
-    all_base = {a.to_asp().rstrip(".") for a in base}
-    non_leaves = all_base - leaves
+    grounded = clingo_grounding(program, base)
+    true_facts = list(grounded["true_facts"])
 
-    num_yes = int(n * yes_ratio)
-    num_no = n - num_yes
+    proof_chains = []
+    for atom in true_facts:
+        info = determine_how_proved(program, base, atom)
+        if info["derivable"] and info["depth"] > 0:
+            proof_chains.append((atom, info))
 
-    yes_samples = random.sample(list(leaves), min(num_yes, len(leaves)))
-    no_samples = random.sample(list(non_leaves), min(num_no, len(non_leaves)))
+    if not proof_chains:
+        return []
 
-    tasks = []
-    for hid_str in yes_samples + no_samples:
-        want_yes = hid_str in yes_samples
-        hidden = next(a for a in base if a.to_asp().rstrip(".") == hid_str)
-        context = [a for a in base if a != hidden]
-        label = "YES" if want_yes else "NO"
-        depth = d if want_yes else "not applicable"
-        q = hidden.to_asp()
-        c = program.to_asp() + "\n" + "\n".join(a.to_asp() for a in context)
-        nl = generate_abduction_prompt(program, context, hidden, obs)
-        tasks.append(
-            {
+    true_tasks = []
+    false_tasks = []
+
+    for conclusion, proof_info in proof_chains:
+        # 1) Identify which base facts were actually used in the proof of `conclusion`
+        used_base = set()
+        for step in proof_info["steps"]:
+            for body_atom_str in step["body_atoms"]:
+                for b in base:
+                    if str(b) == body_atom_str:
+                        used_base.add(b)
+
+        # 2) Identify which base facts were never used
+        non_used = [b for b in base if b not in used_base]
+
+        # === Build “true” abduction tasks ===
+        # For each h ∈ used_base, remove h from base and check that:
+        #   (a) without h, conclusion is not derivable
+        #   (b) with h added back, conclusion is derivable
+        for h in used_base:
+            if len(true_tasks) + len(false_tasks) >= n:
+                break
+            context_true = [b for b in base if b != h]
+            if not is_explanation(program, context_true, h, conclusion):
+                continue
+            q = h.to_asp().strip()
+            c = program.to_asp() + "\n" + "\n".join(a.to_asp() for a in context_true)
+            nl = generate_abduction_prompt(program, context_true, h, conclusion)
+            true_tasks.append({
                 "q": q,
                 "c": c,
                 "natural language": nl,
-                "t": label,
-                "metadata": {**config, "depth": depth, "reasoning_type": "abduction"},
-            }
-        )
-    return tasks
+                "t": "true",
+                "metadata": {
+                    **config,
+                    "reasoning_type": "abduction",
+                    "conclusion": str(conclusion),
+                    "explanation": str(h),
+                    "proof_depth": proof_info["depth"],
+                }
+            })
+
+        # === Build “false” abduction tasks ===
+        # For each x ∈ used_base, remove x from base so conclusion is broken,
+        # then for each h ∈ non_used, check that adding h back STILL fails to derive conclusion.
+        for x in used_base:
+            if len(true_tasks) + len(false_tasks) >= n:
+                break
+            context_false_base = [b for b in base if b != x]
+            # Confirm conclusion is indeed not derivable without x:
+            without_x = clingo_grounding(program, context_false_base)
+            if conclusion in without_x["true_facts"]:
+                # If removing x does NOT break the chain, skip this x
+                continue
+
+            for h in non_used:
+                if len(true_tasks) + len(false_tasks) >= n:
+                    break
+                # Add h to the context where x was removed
+                with_h = clingo_grounding(program, context_false_base + [h])
+                # If conclusion STILL NOT derivable, h is a “false” explanation
+                if conclusion not in with_h["true_facts"]:
+                    q = h.to_asp().strip()
+                    c = program.to_asp() + "\n" + "\n".join(a.to_asp() for a in context_false_base)
+                    nl = generate_abduction_prompt(program, context_false_base, h, conclusion)
+                    false_tasks.append({
+                        "q": q,
+                        "c": c,
+                        "natural language": nl,
+                        "t": "false",
+                        "metadata": {
+                            **config,
+                            "reasoning_type": "abduction",
+                            "conclusion": str(conclusion),
+                            "non_explanation": str(h),
+                            "proof_depth": "not applicable",
+                        }
+                    })
+
+    # Now sample from both pools to get exactly n tasks
+    num_true  = int(n * yes_ratio)
+    num_false = n - num_true
+
+    sampled_true  = random.sample(true_tasks,  min(num_true,  len(true_tasks)))
+    sampled_false = random.sample(false_tasks, min(num_false, len(false_tasks)))
+    return (sampled_true + sampled_false)[:n]
 
 
 def generate_deduction_prompt(
@@ -506,8 +542,7 @@ def generate_deduction_prompt(
     """
     Generate a natural language prompt for deduction tasks.
     """
-    displayed = list(program.rules)
-    rules = [r.to_nl() for r in displayed]
+    rules = [r.to_nl() for r in program.rules]
     facts = [f"{a.to_nl()}." for a in base]
     return (
         "You are given the following information:\n"
@@ -515,29 +550,26 @@ def generate_deduction_prompt(
         + "\n\nAnd the following facts:\n"
         + "\n".join(facts)
         + f"\n\nQUESTION:\nIs {target.to_nl()} true?"
-        + "\nFirst, think through each premise step by step. \n Answer exactly YES or NO, and in rationale briefly explain your reasoning"
+        + "\nAnswer exactly true or false."
     )
 
 
 def generate_abduction_prompt(
-    program: LogicProgram, ctx: List[Atom], query: Atom, obs: Atom
+    program: LogicProgram, context: List[Atom], hypothesis: Atom, conclusion: Atom
 ) -> str:
     """
     Generate a natural language prompt for abduction tasks.
     """
-    displayed = list(program.rules)
-    rules = [r.to_nl() for r in displayed]
-    facts = [f"{a.to_nl()}." for a in base]
+    rules = [r.to_nl() for r in program.rules]
+    facts = [f"{a.to_nl()}." for a in context]
     return (
         "You are given the following rules:\n"
         + "\n".join(rules)
         + "\n\nAnd the following facts:\n"
         + "\n".join(facts)
-        + f"\n\nOBSERVATION: {obs.to_nl()} is true."
-        + f"\n\nQUESTION:\nCould {query.to_nl()} be true?"
-        + "\nFirst, think through each premise step by step.\nAnswer exactly YES or NO, and in rationale briefly explain your reasoning."
+        + f"\n\nQUESTION:\nCould {hypothesis.to_nl()} explain {conclusion.to_nl()}?"
+        + "\nAnswer exactly true or false."
     )
-
 
 
 # Main driver: sweeping diverse configs
@@ -571,4 +603,3 @@ if __name__ == "__main__":
     with open("propositional_benchmark.json", "w") as f:
         json.dump(all_tasks, f, indent=2)
     print(f"Generated {len(all_tasks)} total tasks in propositional_benchmark.json")
-
