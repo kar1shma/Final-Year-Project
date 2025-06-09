@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 VARIABLE_POOL = ["X", "Y", "Z", "U", "V", "W"]
 
-def _indefinite(typ: str) -> str:
-    return "someone" if typ == "person" else "something"
+def _var_name(typ: str, var: str) -> str:
+    return f"{typ} {var}"
 
 
 # --------------------------
@@ -70,7 +70,9 @@ class Atom:
         words: List[str] = []
         for i, t in enumerate(self.terms):
             if t and t[0].isupper():
-                words.append(_indefinite(self.predicate.arg_types[i]))
+                # t is a variable like "X", so show "person X" or "object X"
+                typ = self.predicate.arg_types[i]
+                words.append(_var_name(typ, t))
             else:
                 words.append(t)
         return self.predicate.nl_template.format(*words)
@@ -100,11 +102,13 @@ class Rule:
         return repr(self)
 
     def to_nl(self) -> str:
-        head_nl = self.head.to_nl()
-        if self.is_fact():
-            return f"{head_nl}."
-        conds_nl = " and ".join(b.to_nl() for b in self.body)
-        return f"If {conds_nl}, then {head_nl}."
+        vars = {t for b in [self.head]+self.body for t in b.terms if t[0].isupper()}
+        core = (f"If {' and '.join(b.to_nl() for b in self.body)}, then {self.head.to_nl()}."
+                if self.body else f"{self.head.to_nl()}.")
+        if vars:
+            vs = ", ".join(sorted(vars))
+            return f"For all {vs}, {core}"
+        return core
 
 
 class LogicProgram:
@@ -133,12 +137,32 @@ PREDICATE_POOL: List[Predicate] = [
     Predicate("small", 1, ["object"], "{0} is small"),
     Predicate("clean", 1, ["object"], "{0} is clean"),
     Predicate("red", 1, ["object"], "{0} is red"),
+    Predicate("heavy",   1, ["object"], "{0} is heavy"),
+    Predicate("light",   1, ["object"], "{0} is light"),
+    Predicate("soft",    1, ["object"], "{0} is soft"),
+    Predicate("hard",    1, ["object"], "{0} is hard"),
+    Predicate("smooth",  1, ["object"], "{0} is smooth"),
+    Predicate("rough",   1, ["object"], "{0} is rough"),
+    Predicate("new",     1, ["object"], "{0} is new"),
+    Predicate("old",     1, ["object"], "{0} is old"),
+    Predicate("dirty",   1, ["object"], "{0} is dirty"),
     Predicate("sad", 1, ["person"], "{0} is sad"),
     Predicate("tall", 1, ["person"], "{0} is tall"),
     Predicate("happy", 1, ["person"], "{0} is happy"),
     Predicate("hungry", 1, ["person"], "{0} is hungry"),
     Predicate("calm", 1, ["person"], "{0} is calm"),
     Predicate("excited", 1, ["person"], "{0} is excited"),
+    Predicate("angry",   1, ["person"], "{0} is angry"),
+    Predicate("brave",   1, ["person"], "{0} is brave"),
+    Predicate("clever",  1, ["person"], "{0} is clever"),
+    Predicate("curious", 1, ["person"], "{0} is curious"),
+    Predicate("tired",   1, ["person"], "{0} is tired"),
+    Predicate("friendly",1, ["person"], "{0} is friendly"),
+    Predicate("strong",  1, ["person"], "{0} is strong"),
+    Predicate("weak",    1, ["person"], "{0} is weak"),
+    Predicate("bored",   1, ["person"], "{0} is bored"),
+    Predicate("busy",   1, ["person"], "{0} is busy"),
+    Predicate("funny",   1, ["person"], "{0} is funny"),
     Predicate("owns", 2, ["person", "object"], "{0} owns {1}"),
     Predicate("likes", 2, ["person", "object"], "{0} likes {1}"),
     Predicate("dislikes", 2, ["person", "object"], "{0} dislikes {1}"),
@@ -357,7 +381,7 @@ def generate_fol_program(
     other_base = random.sample(list(atoms), min(cfg["num_base_facts"]-1, len(atoms)))
     base = [root_fact] + other_base
 
-    return prog, base
+    return prog, base, chain_seq
 
 
 # --------------------------
@@ -539,45 +563,61 @@ def determine_how_proved(
 def generate_multiple_deduction_tasks(
     program: LogicProgram,
     base: List[Atom],
+    chain_seq: List[Predicate],      # <— the list [p0, p1, …, p_d]
     config: Dict[str, Any],
     n: int,
     yes_ratio: float = 0.9,
 ) -> List[Dict[str, Any]]:
-    grounded = clingo_grounding(program, base)
-    true_facts = grounded["true_facts"]
-    false_facts = grounded["false_facts"]
+    """
+    Use the inductive chain: exactly chain_seq[i](c) is derivable in i steps.
+    We pick chain_seq[d] as our positive, and random false atoms as negatives.
+    """
+    d = config["proof_depth"]
+    const = base[0].terms[0]   # the constant we used for the chain
 
-    proofs = {
-        atom: determine_how_proved(program, base, atom)
-        for atom in true_facts
-    }
-    yes_pool = [a for a, info in proofs.items() if info["derivable"]]
-    no_pool  = list(false_facts)
+    # 1) Positive target: p_d(const)
+    head_pred = chain_seq[d]
+    positive = Atom(head_pred, [const])
 
-    num_yes = int(n * yes_ratio)
+    # ensure it's not in the base facts
+    assert positive not in base, (
+        f"BUG: positive {positive} was in the base facts!"
+    )
+
+    # 2) Negative pool: any ground atom *not* in the chain or base
+    #    (you can still call your clingo_grounding to get false_facts if you like,
+    #     but for simplicity we'll just enumerate all ground atoms and drop the chain)
+    all_atoms = list(get_all_ground_atoms(program))
+    forbidden = set(base) | {Atom(p, [const]) for p in chain_seq}
+    negatives = [a for a in all_atoms if a not in forbidden]
+
+    # 3) Sample
+    num_yes = min(int(n * yes_ratio), 1)   # we only have one guaranteed positive
     num_no  = n - num_yes
 
-    yes_samples = random.sample(yes_pool, min(num_yes, len(yes_pool)))
-    no_samples  = random.sample(no_pool,  min(num_no,  len(no_pool)))
+    yes_samples = [positive]  # we only ever use that one
+    no_samples  = random.sample(negatives, num_no)
 
-    tasks: List[Dict[str, Any]] = []
-    for target in yes_samples + no_samples:
-        label = "true" if target in yes_samples else "false"
-        depth = config["proof_depth"] if label == "true" else "not applicable"
-        q = target.to_asp().strip()
+    # 4) Build tasks
+    tasks = []
+    for atom in yes_samples + no_samples:
+        label = "true" if atom in yes_samples else "false"
+        q = atom.to_asp().strip()
         c_rules = program.to_asp()
         c_facts = "\n".join(a.to_asp() for a in base)
-        c = f"{c_rules}\n{c_facts}"
-        nl = generate_deduction_prompt(program, base, target)
-        tasks.append(
-            {
-                "q": q,
-                "c": c,
-                "natural language": nl,
-                "t": label,
-                "metadata": {**config, "depth": depth, "reasoning_type": "deduction"},
-            }
-        )
+        nl = generate_deduction_prompt(program, base, atom)
+        tasks.append({
+            "q": q,
+            "c": c_rules + "\n" + c_facts,
+            "natural language": nl,
+            "t": label,
+            "metadata": {
+                **config,
+                "depth": d if label=="true" else "not applicable",
+                "reasoning_type": "deduction",
+            },
+        })
+
     return tasks
 
 
@@ -589,7 +629,7 @@ def generate_multiple_abduction_tasks(
     base: List[Atom],
     config: Dict[str, Any],
     n: int,
-    yes_ratio: float = 0.9,
+    yes_ratio: float = 0.999,
 ) -> List[Dict[str, Any]]:
     """
     Strict “mirror‐of‐deduction” abduction:
@@ -746,11 +786,11 @@ def generate_abduction_prompt(
 # Main Driver: Generate & Save Benchmark
 # --------------------------
 if __name__ == "__main__":
-    NUM_RULES      = [5, 15, 25, 35]
+    NUM_RULES      = [5, 10, 15, 20, 25]
     NUM_BASE_FACTS = [4, 8, 12, 16, 20]
-    PROOF_DEPTHS   = [1, 5, 10, 20, 30]
+    PROOF_DEPTHS   = [1, 5, 10, 20]
     RECURSION_OPTIONS = [True, False]
-    TASKS_PER_GROUP = 5
+    TASKS_PER_GROUP = 4
     GROUPS_PER_CFG  = 1
 
     all_tasks: List[Dict[str, Any]] = []
@@ -766,13 +806,13 @@ if __name__ == "__main__":
             "num_base_facts":   nb,
         }
         for _ in range(GROUPS_PER_CFG):
-            prog, base = generate_fol_program(cfg)
-            ded_tasks = generate_multiple_deduction_tasks(prog, base, cfg, TASKS_PER_GROUP)
+            prog, base, chain_seq = generate_fol_program(cfg)
+            ded_tasks = generate_multiple_deduction_tasks(prog, base, chain_seq, cfg, TASKS_PER_GROUP)
             abd_tasks = generate_multiple_abduction_tasks(prog, base, cfg, TASKS_PER_GROUP)
             all_tasks.extend(ded_tasks)
             all_tasks.extend(abd_tasks)
 
-    with open("first_order_benchmark.json", "w") as f:
+    with open("n_first_order_benchmark.json", "w") as f:
         json.dump(all_tasks, f, indent=2)
 
-    print(f"Generated {len(all_tasks)} total tasks in first_order_benchmark.json")
+    print(f"Generated {len(all_tasks)} total tasks in n_first_order_benchmark.json")
