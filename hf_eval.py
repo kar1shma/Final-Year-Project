@@ -1,144 +1,164 @@
+#!/usr/bin/env python3
 import json
-import re
-import random
 import argparse
+import random
 import pathlib
+import re
 from tqdm import tqdm
-from typing import Tuple
+from typing import List, Dict, Any
 
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+    pipeline,
+)
 
+# Helpers
 
-# ---------- helpers ----------------------------------------------------------
-# Accept YES/NO/TRUE/FALSE in any case, then normalize
-YESNO_RE = re.compile(r"\b(YES|NO|TRUE|FALSE)\b", re.I)
+TF_ENUM = ["true", "false"]
+# regex to extract the enum
+TF_RE = re.compile(r'"answer"\s*:\s*"(\w+)"')
 
-def shuffle_rules(nl_prompt: str) -> str:
-    """
-    Shuffle only the rule lines (between the opening line and the blank line
-    before 'And the following facts:'). Leave everything else untouched.
-    """
-    lines = nl_prompt.splitlines()
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {
+            "type": "string",
+            "enum": TF_ENUM
+        }
+    },
+    "required": ["answer"]
+}
+SCHEMA_PROMPT = json.dumps(SCHEMA, indent=2)
+
+def shuffle_rules(nl: str) -> str:
+    lines = nl.splitlines()
     split = None
     for i, ln in enumerate(lines):
-        if (
-            not ln.strip()
-            and i + 1 < len(lines)
-            and lines[i + 1].startswith("And the following facts:")
-        ):
+        if not ln.strip() and i+1 < len(lines) and lines[i+1].startswith("And the following facts"):
             split = i
             break
     if split is None:
-        return nl_prompt
+        return nl
+    header, rules, footer = lines[:1], lines[1:split], lines[split:]
+    random.shuffle(rules)
+    return "\n".join(header + rules + footer)
 
-    header = lines[:1]
-    rule_lines = lines[1:split]
-    footer = lines[split:]
-    random.shuffle(rule_lines)
-    return "\n".join(header + rule_lines + footer)
+def build_prompt(nl: str, shuffle: bool) -> str:
+    p = nl.strip()
+    if shuffle:
+        p = shuffle_rules(p)
+    return (
+        "Please reply with exactly one JSON object matching this schema:\n"
+        f"{SCHEMA_PROMPT}\n\n"
+        "### Question:\n"
+        f"{p}\n\n"
+        "### Answer:"
+    )
+
+def extract_answer(text: str) -> str:
+    # 1) If it's already a bool, map directly
+    if isinstance(text, bool):
+        return "true" if text else "false"
+
+    # 2) Cast to string
+    txt = text if isinstance(text, str) else str(text)
+
+    # 3) Try JSON
+    try:
+        obj = json.loads(txt)
+        ans = obj.get("answer", "").lower()
+        if ans in TF_ENUM:
+            return ans
+    except Exception:
+        pass
+
+    # 4) Fallback regex
+    m = TF_RE.search(txt)
+    if m and m.group(1).lower() in TF_ENUM:
+        return m.group(1).lower()
+
+    return "ERROR"
 
 
-def parse_answer(text: str) -> Tuple[str, str]:
-    """
-    Extract the first YES/NO/TRUE/FALSE token and return (answer, remainder).
-    Normalize to lowercase "true"/"false".
-    """
-    m = YESNO_RE.search(text)
-    if not m:
-        return "ERROR", text.strip()
-
-    token = m.group(1).upper()
-    if token in {"YES", "TRUE"}:
-        ans = "true"
-    else:
-        ans = "false"
-    rationale = text[m.end():].lstrip(" .,\n")
-    return ans, rationale
-
+# Main run
 
 def run(
     model_id: str,
-    tasks: list[dict],
+    tasks: List[Dict[str, Any]],
     out_path: pathlib.Path,
-    batch_size: int = 8,
-    shuffle: bool = False,
-) -> None:
+    batch_size: int,
+    shuffle: bool,
+):
     device = 0 if torch.cuda.is_available() else -1
     print(f"Loading {model_id} on device {device} ...")
-
+    cfg = AutoConfig.from_pretrained(model_id)
+    is_causal = cfg.architectures and any(a.lower().startswith(("llama","gpt","gemma", "dolly")) for a in cfg.architectures)
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
-    model.to(device)
 
-    gen = pipeline("text2text-generation", model=model, tokenizer=tok, device=device)
+    if is_causal:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
+        generator = pipeline("text-generation", model=model, tokenizer=tok, device=device, pad_token_id=tok.eos_token_id, trust_remote_code=False, return_full_text=False)
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
+        generator = pipeline("text2text-generation", model=model, tokenizer=tok, device=device, pad_token_id=tok.eos_token_id, trust_remote_code=False)
+    
 
-    # ===== updated instruction: ask for true/false only =====
-    instr = "Answer exactly true or false.\n\n### Question:\n"
+    prompts = [build_prompt(t["natural language"], shuffle) for t in tasks]
 
-    prompts = []
-    for t in tasks:
-        p = t["natural language"].strip()
-        if shuffle:
-            p = shuffle_rules(p)
-        prompts.append(instr + p + "\n\n### Answer:")
+    outputs: List[str] = []
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
+        batch = prompts[i : i + batch_size]
+        outs = generator(batch, max_new_tokens=32, do_sample=False, num_beams=4, temperature=0.0)
+        for idx_in_batch, o in enumerate(outs):
+            # if it's a dict with generated_text, pull that,
+            # otherwise assume it's already the string
+            text = o["generated_text"] if isinstance(o, dict) else str(o)
+            text = text.strip()
 
-    outputs: list[str] = []
-    chunks = (len(prompts) + batch_size - 1) // batch_size
-    for i in tqdm(range(chunks), desc="Generation"):
-        start, end = i * batch_size, min((i + 1) * batch_size, len(prompts))
-        outs = gen(
-            prompts[start:end],
-            max_new_tokens=32,
-            num_beams=4,
-            do_sample=False,
-        )
-        outputs.extend(o["generated_text"].strip() for o in outs)
+            # global index
+            global_idx = i + idx_in_batch
+            tqdm.write(f"[{global_idx:04d}] → {text!r}")
+
+            outputs.append(text)
 
     assert len(outputs) == len(tasks)
 
     results = []
-    for task, text in tqdm(list(zip(tasks, outputs)), desc="Parsing outputs"):
-        ans, rat = parse_answer(text)
+    for task, out in zip(tasks, outputs):
+        ans = extract_answer(out)
         rec = {
-            "q": task["q"],
-            "c": task["c"],
-            "natural language": task["natural language"],
-            "t": task["t"],
-            "metadata": task["metadata"],
+            **task,
             "pred": ans,
-            "rationale": rat,
+            "raw_output": out,
         }
         results.append(rec)
 
-    json.dump(results, out_path.open("w"), indent=2)
-    print(f"Done – {len(results)} records written to {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Done: wrote {len(results)} records to {out_path}")
 
+
+# Entry Point
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model_id",
-        required=True,
-        help="HF model ID, e.g. google/flan-t5-xl",
+    parser = argparse.ArgumentParser(
+        description="Evaluate a set of logic-reasoning tasks on any HF model."
     )
-    ap.add_argument(
-        "--tasks",
-        required=True,
-        help="benchmark.json produced by your generator",
-    )
-    ap.add_argument(
-        "--out",
-        required=True,
-        help="where to write the results JSON",
-    )
-    ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument(
+    parser.add_argument("--model_id", required=True, help="HuggingFace model ID")
+    parser.add_argument("--tasks", required=True, help="JSON file of tasks")
+    parser.add_argument("--out", required=True, help="Output JSON path")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
         "--shuffle_rules",
         action="store_true",
-        help="shuffle the rule lines inside each prompt",
+        help="Randomly permute the rule lines in each prompt",
     )
-    args = ap.parse_args()
+    args = parser.parse_args()
 
     tasks = json.load(open(args.tasks))
     run(
@@ -152,7 +172,7 @@ if __name__ == "__main__":
 
 # Example usage:
 # python hf_eval.py --model_id google/flan-t5-xl \
-#                   --tasks benchmark.json \
-#                   --out results.json \
+#                   --tasks first_order_benchmark.json \
+#                   --out flan_fol_shuffled_results.json \
 #                   --batch_size 8 \
 #                   --shuffle_rules
