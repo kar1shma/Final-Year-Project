@@ -431,7 +431,7 @@ def generate_enhanced_fol_program(cfg: Dict[str, Any]) -> Tuple[LogicProgram, Li
     
     return prog, base, chain_seq
 
-# Clingo solving (simplified version)
+# Clingo solving
 def solve_program(program: LogicProgram, base_facts: List[Atom]) -> Set[Atom]:
     """Simple forward chaining solver"""
     known = set(base_facts)
@@ -612,8 +612,8 @@ def generate_benchmark():
     NUM_BASE_FACTS = [4, 8, 12, 16, 20]
     PROOF_DEPTHS = [1, 5, 10, 20]
     RECURSION_OPTIONS = [True, False]
-    TASKS_PER_GROUP = 4
-    GROUPS_PER_CFG = 1
+    TASKS_PER_GROUP = 2
+    GROUPS_PER_CFG = 2
 
     all_tasks = []
     task_id = 0
@@ -653,7 +653,6 @@ def generate_benchmark():
     return all_tasks
 
 if __name__ == "__main__":
-    print("Generating new benchmark with proper existential quantification...")
     
     tasks = generate_benchmark()
     
@@ -672,9 +671,6 @@ if __name__ == "__main__":
                     existential_count += 1
                     break
     
-    with open("new_first_order_benchmark_with_existentials.json", "w") as f:
+    with open("balanced_first_order_benchmark.json", "w") as f:
         json.dump(tasks, f, indent=2)
     
-    print(f"Generated {len(tasks)} tasks")
-    print(f"Estimated existential rules: {existential_count}/{total_rules}")
-    print(f"Saved to: new_first_order_benchmark_with_existentials.json")
