@@ -1,2 +1,2 @@
 # Final-Year-Project
-put name of benchmark here...
+# LogicBench: A New Logical Reasoning Benchmark for LLMs
