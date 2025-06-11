@@ -1,0 +1,23 @@
+name: llm-bench-clean
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - accelerate
+  - clingo
+  - colorama
+  - instructor==1.8.3
+  - llama-cpp-python=0.2.24
+  - numpy[version='<2']
+  - pandas
+  - pip
+  - pydantic[version='<3']
+  - python=3.10
+  - pytorch-cuda[version='11.8.*,11.8.*']
+  - rich
+  - sentencepiece
+  - tokenizers=0.15
+  - tqdm
+  - transformers=4.39.3
+  - ipykernel
+prefix: /vol/bitbucket/kks21/conda/envs/llm-bench-clean
