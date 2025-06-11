@@ -16,7 +16,6 @@ from transformers import (
     pipeline,
 )
 
-# Helpers
 
 TF_ENUM = ["true", "false"]
 # regex to extract the enum
@@ -60,14 +59,11 @@ def build_prompt(nl: str, shuffle: bool) -> str:
     )
 
 def extract_answer(text: str) -> str:
-    # 1) If it's already a bool, map directly
     if isinstance(text, bool):
         return "true" if text else "false"
 
-    # 2) Cast to string
     txt = text if isinstance(text, str) else str(text)
 
-    # 3) Try JSON
     try:
         obj = json.loads(txt)
         ans = obj.get("answer", "").lower()
@@ -76,7 +72,6 @@ def extract_answer(text: str) -> str:
     except Exception:
         pass
 
-    # 4) Fallback regex
     m = TF_RE.search(txt)
     if m and m.group(1).lower() in TF_ENUM:
         return m.group(1).lower()
@@ -84,7 +79,6 @@ def extract_answer(text: str) -> str:
     return "ERROR"
 
 
-# Main run
 
 def run(
     model_id: str,
@@ -96,7 +90,7 @@ def run(
     device = 0 if torch.cuda.is_available() else -1
     print(f"Loading {model_id} on device {device} ...")
     cfg = AutoConfig.from_pretrained(model_id)
-    is_causal = cfg.architectures and any(a.lower().startswith(("llama","gpt","gemma", "dolly")) for a in cfg.architectures)
+    is_causal = cfg.architectures and any(a.lower().startswith(("llama","gpt","gemma")) for a in cfg.architectures)
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
     if is_causal:
@@ -114,12 +108,9 @@ def run(
         batch = prompts[i : i + batch_size]
         outs = generator(batch, max_new_tokens=32, do_sample=False, num_beams=4, temperature=0.0)
         for idx_in_batch, o in enumerate(outs):
-            # if it's a dict with generated_text, pull that,
-            # otherwise assume it's already the string
             text = o["generated_text"] if isinstance(o, dict) else str(o)
             text = text.strip()
 
-            # global index
             global_idx = i + idx_in_batch
             tqdm.write(f"[{global_idx:04d}] → {text!r}")
 
@@ -143,7 +134,6 @@ def run(
     print(f"Done: wrote {len(results)} records to {out_path}")
 
 
-# Entry Point
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

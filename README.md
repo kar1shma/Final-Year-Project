@@ -1,2 +1,2 @@
 # Final-Year-Project
-# LogicBench: A New Logical Reasoning Benchmark for LLMs
+# SynthLogic: A New Synthetic Logical Reasoning Benchmark for LLMs
